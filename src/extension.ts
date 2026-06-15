@@ -1,0 +1,271 @@
+/**
+ * envpact-vscode — VS Code extension for the envpact ecosystem.
+ *
+ * Provides a sidebar to browse the local vault, command palette
+ * commands for every operation envpact-cli supports, and codelens
+ * on .env.example files showing resolution status.
+ */
+
+import * as vscode from 'vscode';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+import {
+  loadVault,
+  saveVault,
+  vaultExists,
+  setProjectSecret,
+  setSharedSecret,
+  findReferencingProjects,
+  pullVault,
+  pushVault,
+  detectProjectFromGit,
+  SECRETS_DIR,
+  SECRETS_FILE,
+} from './vault';
+import { resolveProject } from './resolver';
+import { parseEnvExample, renderEnv, writeEnvAtomic, ensureGitignoreCovers } from './envwriter';
+import { ProjectsTreeProvider, SharedTreeProvider } from './sidebar';
+
+const execFileP = promisify(execFile);
+
+let projectsProvider: ProjectsTreeProvider;
+let sharedProvider: SharedTreeProvider;
+let statusBarItem: vscode.StatusBarItem;
+
+export function activate(context: vscode.ExtensionContext) {
+  projectsProvider = new ProjectsTreeProvider();
+  sharedProvider = new SharedTreeProvider();
+  vscode.window.registerTreeDataProvider('envpact.projects', projectsProvider);
+  vscode.window.registerTreeDataProvider('envpact.shared', sharedProvider);
+
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBarItem.command = 'envpact.generateEnv';
+  context.subscriptions.push(statusBarItem);
+  refreshStatusBar();
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('envpact.generateEnv', generateEnvCommand),
+    vscode.commands.registerCommand('envpact.initVault', initVaultCommand),
+    vscode.commands.registerCommand('envpact.refreshVault', refreshVaultCommand),
+    vscode.commands.registerCommand('envpact.addSecret', addSecretCommand),
+    vscode.commands.registerCommand('envpact.addSharedSecret', addSharedSecretCommand),
+    vscode.commands.registerCommand('envpact.rotateSecret', rotateSecretCommand),
+    vscode.commands.registerCommand('envpact.syncGitHub', syncGitHubCommand),
+    vscode.commands.registerCommand('envpact.listProjects', listProjectsCommand)
+  );
+}
+
+export function deactivate() { /* no-op */ }
+
+function refreshStatusBar() {
+  if (vaultExists()) {
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const project = wsRoot ? detectProjectFromGit(wsRoot) : '';
+    statusBarItem.text = `$(lock) envpact: ${project || 'ready'}`;
+    statusBarItem.tooltip = `envpact vault at ${SECRETS_DIR}\nClick to generate .env`;
+  } else {
+    statusBarItem.text = '$(unlock) envpact: not initialized';
+    statusBarItem.tooltip = 'Run envpact: Initialize Vault';
+  }
+  statusBarItem.show();
+}
+
+function refreshAll() {
+  projectsProvider.refresh();
+  sharedProvider.refresh();
+  refreshStatusBar();
+}
+
+async function generateEnvCommand() {
+  try {
+    if (!vaultExists()) {
+      const ans = await vscode.window.showWarningMessage(
+        'envpact vault is not initialised. Initialize now?',
+        'Initialize',
+        'Cancel'
+      );
+      if (ans !== 'Initialize') return;
+      return initVaultCommand();
+    }
+
+    const ws = vscode.workspace.workspaceFolders?.[0];
+    if (!ws) {
+      vscode.window.showErrorMessage('Open a workspace folder first.');
+      return;
+    }
+    const cwd = ws.uri.fsPath;
+    const project = detectProjectFromGit(cwd);
+
+    const cfg = vscode.workspace.getConfiguration('envpact');
+    const defaultEnv = cfg.get<string>('defaultEnvironment', 'default');
+    const envChoice = await vscode.window.showQuickPick(
+      ['default', 'development', 'staging', 'production', 'Custom…'],
+      { placeHolder: `Environment (default: ${defaultEnv})`, ignoreFocusOut: true }
+    );
+    if (!envChoice) return;
+    let environment = envChoice === 'Custom…'
+      ? await vscode.window.showInputBox({ prompt: 'Custom environment name', ignoreFocusOut: true }) ?? ''
+      : envChoice;
+    if (environment === 'default') environment = '';
+
+    if (cfg.get<boolean>('autoPullOnGenerate', true)) {
+      const r = pullVault();
+      if (!r.ok) vscode.window.showWarningMessage(`Vault pull warning: ${r.error}`);
+    }
+
+    const vault = loadVault();
+    const result = resolveProject(vault, project, environment || undefined);
+    const examplePath = path.join(cwd, '.env.example');
+    const required = parseEnvExample(examplePath);
+    const ordered = required.length ? required : Object.keys(result.resolved);
+    const content = renderEnv(ordered, result.resolved, { project, environment: result.environment });
+
+    const out = path.join(cwd, '.env');
+    writeEnvAtomic(out, content);
+    ensureGitignoreCovers(cwd, '.env');
+
+    vscode.window.showInformationMessage(
+      `envpact: wrote ${Object.keys(result.resolved).length} keys to .env (env=${result.environment})` +
+      (result.unresolved.length ? `. Unresolved: ${result.unresolved.join(', ')}` : '')
+    );
+    refreshAll();
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`envpact: ${e.message}`);
+  }
+}
+
+async function initVaultCommand() {
+  if (vaultExists()) {
+    vscode.window.showInformationMessage(`envpact vault already initialised at ${SECRETS_DIR}`);
+    return;
+  }
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: 'Auto (recommended)', detail: 'Run `envpact-cli --init auto` — creates a private repo via gh CLI.' },
+      { label: 'Existing vault URL', detail: 'I already have a vault repo somewhere.' },
+    ],
+    { placeHolder: 'Initialise envpact vault', ignoreFocusOut: true }
+  );
+  if (!choice) return;
+
+  const term = vscode.window.createTerminal({ name: 'envpact init' });
+  term.show();
+  if (choice.label.startsWith('Auto')) {
+    term.sendText('npx envpact-cli --init auto');
+  } else {
+    const url = await vscode.window.showInputBox({
+      prompt: 'Vault git URL (e.g. git@github.com:you/envpact-secrets.git)',
+      ignoreFocusOut: true,
+    });
+    if (!url) return;
+    term.sendText(`npx envpact-cli --init ${url}`);
+  }
+  vscode.window.showInformationMessage('envpact: initialisation started in terminal. Run "envpact: Refresh Vault" when done.');
+}
+
+async function refreshVaultCommand() {
+  const r = pullVault();
+  if (r.ok) vscode.window.showInformationMessage('envpact: vault pulled');
+  else vscode.window.showWarningMessage(`envpact: ${r.error}`);
+  refreshAll();
+}
+
+async function addSecretCommand() {
+  if (!vaultExists()) return generateEnvCommand();
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  const project = ws ? detectProjectFromGit(ws.uri.fsPath) : '';
+  const targetProject = await vscode.window.showInputBox({
+    prompt: 'Project name', value: project, ignoreFocusOut: true,
+  });
+  if (!targetProject) return;
+  const key = await vscode.window.showInputBox({ prompt: 'Key (e.g. OPENAI_API_KEY)', ignoreFocusOut: true });
+  if (!key) return;
+  const value = await vscode.window.showInputBox({
+    prompt: `Value (or "shared.KEY" reference)`, password: true, ignoreFocusOut: true,
+  });
+  if (value == null) return;
+  const env = await vscode.window.showInputBox({
+    prompt: 'Environment (leave empty for flat)', ignoreFocusOut: true,
+  }) ?? '';
+
+  const vault = loadVault();
+  setProjectSecret(vault, targetProject, key, value, env || undefined);
+  saveVault(vault);
+  pushVault(`envpact-vscode: set ${targetProject}.${key}`);
+  vscode.window.showInformationMessage(`envpact: set ${targetProject}.${key}`);
+  refreshAll();
+}
+
+async function addSharedSecretCommand() {
+  if (!vaultExists()) return generateEnvCommand();
+  const key = await vscode.window.showInputBox({ prompt: 'Shared key name', ignoreFocusOut: true });
+  if (!key) return;
+  const value = await vscode.window.showInputBox({ prompt: `Value for shared.${key}`, password: true, ignoreFocusOut: true });
+  if (value == null) return;
+  const vault = loadVault();
+  setSharedSecret(vault, key, value);
+  saveVault(vault);
+  pushVault(`envpact-vscode: set shared.${key}`);
+  vscode.window.showInformationMessage(`envpact: set shared.${key}`);
+  refreshAll();
+}
+
+async function rotateSecretCommand() {
+  if (!vaultExists()) return generateEnvCommand();
+  const vault = loadVault();
+  const sharedKeys = Object.keys(vault.shared || {});
+  if (!sharedKeys.length) {
+    vscode.window.showInformationMessage('No shared secrets to rotate.');
+    return;
+  }
+  const key = await vscode.window.showQuickPick(sharedKeys, {
+    placeHolder: 'Select shared secret to rotate',
+    ignoreFocusOut: true,
+  });
+  if (!key) return;
+  const refs = findReferencingProjects(vault, key);
+  const newValue = await vscode.window.showInputBox({
+    prompt: `New value for shared.${key} (used by ${refs.length} reference(s))`,
+    password: true,
+    ignoreFocusOut: true,
+  });
+  if (newValue == null) return;
+  setSharedSecret(vault, key, newValue);
+  saveVault(vault);
+  pushVault(`envpact-vscode: rotate shared.${key}`);
+  vscode.window.showInformationMessage(`envpact: rotated shared.${key} (${refs.length} ref(s))`);
+  refreshAll();
+}
+
+async function syncGitHubCommand() {
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) {
+    vscode.window.showErrorMessage('Open a workspace folder first.');
+    return;
+  }
+  const term = vscode.window.createTerminal({ name: 'envpact sync' });
+  term.show();
+  term.sendText('npx envpact-cli --github');
+}
+
+async function listProjectsCommand() {
+  if (!vaultExists()) {
+    vscode.window.showInformationMessage('envpact vault is not initialised.');
+    return;
+  }
+  const vault = loadVault();
+  const projects = Object.keys(vault.projects || {}).sort();
+  if (!projects.length) {
+    vscode.window.showInformationMessage('No projects in vault yet.');
+    return;
+  }
+  const pick = await vscode.window.showQuickPick(projects, { placeHolder: 'Projects in vault' });
+  if (pick) {
+    vscode.window.showInformationMessage(
+      `${pick}: ${Object.keys(vault.projects![pick]).filter(k => !k.startsWith('_')).length} keys`
+    );
+  }
+}

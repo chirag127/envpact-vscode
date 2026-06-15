@@ -1,0 +1,86 @@
+{
+  "name": "envpact",
+  "displayName": "envpact",
+  "description": "Centralized, serverless secrets manager — manage your private vault visually inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "chirag127",
+  "engines": { "vscode": "^1.85.0" },
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "categories": ["Other", "SCM Providers"],
+  "keywords": ["secrets", "env", "dotenv", "envpact", "secrets-manager"],
+  "homepage": "https://envpact.oriz.in",
+  "repository": { "type": "git", "url": "git+https://github.com/chirag127/envpact-vscode.git" },
+  "bugs": { "url": "https://github.com/chirag127/envpact-vscode/issues" },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:.env.example",
+    "onCommand:envpact.generateEnv",
+    "onCommand:envpact.initVault",
+    "onCommand:envpact.refreshVault"
+  ],
+  "contributes": {
+    "commands": [
+      { "command": "envpact.generateEnv", "title": "envpact: Generate .env" },
+      { "command": "envpact.initVault", "title": "envpact: Initialize Vault" },
+      { "command": "envpact.refreshVault", "title": "envpact: Refresh Vault" },
+      { "command": "envpact.addSecret", "title": "envpact: Add Project Secret" },
+      { "command": "envpact.addSharedSecret", "title": "envpact: Add Shared Secret" },
+      { "command": "envpact.rotateSecret", "title": "envpact: Rotate Shared Secret" },
+      { "command": "envpact.syncGitHub", "title": "envpact: Sync to GitHub Actions" },
+      { "command": "envpact.listProjects", "title": "envpact: List Projects" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "envpact",
+          "title": "envpact",
+          "icon": "resources/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "envpact": [
+        { "id": "envpact.projects", "name": "Projects" },
+        { "id": "envpact.shared", "name": "Shared Secrets" }
+      ]
+    },
+    "configuration": {
+      "title": "envpact",
+      "properties": {
+        "envpact.defaultEnvironment": {
+          "type": "string",
+          "enum": ["default", "development", "staging", "production"],
+          "default": "default",
+          "description": "Default environment used when generating .env files."
+        },
+        "envpact.autoPullOnGenerate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-pull the vault repo before generating .env."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        { "command": "envpact.refreshVault", "when": "view == envpact.projects", "group": "navigation" }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc --noEmit -p ./",
+    "test": "node --test --import tsx tests/*.test.ts",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci --no-audit --no-fund
+      - name: Type check + compile
+        run: node node_modules/typescript/lib/tsc.js -p ./
+      - name: Test
+        run: node --test --import tsx tests/*.test.ts
+      - name: Package (smoke)
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '22'
+        run: |
+          node node_modules/@vscode/vsce/vsce package --no-dependencies -o envpact.vsix
+          ls -la envpact.vsix
