@@ -27,13 +27,31 @@ import {
 } from './vault';
 import { resolveProject } from './resolver';
 import { parseEnvExample, renderEnv, writeEnvAtomic, ensureGitignoreCovers } from './envwriter';
-import { ProjectsTreeProvider, SharedTreeProvider } from './sidebar';
+import { ProjectsTreeProvider, SharedTreeProvider, ResolveErrorState } from './sidebar';
+import {
+  pickEncryptionFailure,
+  stripEncrypted,
+  formatEncryptionErrorMessage,
+} from './encryption-guard';
 
 const execFileP = promisify(execFile);
 
 let projectsProvider: ProjectsTreeProvider;
 let sharedProvider: SharedTreeProvider;
 let statusBarItem: vscode.StatusBarItem;
+
+/**
+ * Most recent encrypted-leaf failure surfaced by generateEnvCommand.
+ * Module-level so refreshStatusBar/refreshAll can render error UI even
+ * when triggered by sidebar refresh, workspace folder changes, etc.
+ */
+let lastResolveError: ResolveErrorState | null = null;
+
+function clearResolveError(): void {
+  if (lastResolveError === null) return;
+  lastResolveError = null;
+  if (projectsProvider) projectsProvider.setResolveError(null);
+}
 
 export function activate(context: vscode.ExtensionContext) {
   projectsProvider = new ProjectsTreeProvider();
@@ -54,7 +72,13 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('envpact.addSharedSecret', addSharedSecretCommand),
     vscode.commands.registerCommand('envpact.rotateSecret', rotateSecretCommand),
     vscode.commands.registerCommand('envpact.syncGitHub', syncGitHubCommand),
-    vscode.commands.registerCommand('envpact.listProjects', listProjectsCommand)
+    vscode.commands.registerCommand('envpact.listProjects', listProjectsCommand),
+    // When the active workspace folder changes the previous error no
+    // longer applies — clear it so the sidebar/statusBar refresh.
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      clearResolveError();
+      refreshAll();
+    })
   );
 }
 
@@ -64,16 +88,28 @@ function refreshStatusBar() {
   if (vaultExists()) {
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const project = wsRoot ? detectProjectFromGit(wsRoot) : '';
-    statusBarItem.text = `$(lock) envpact: ${project || 'ready'}`;
-    statusBarItem.tooltip = `envpact vault at ${SECRETS_DIR}\nClick to generate .env`;
+    if (lastResolveError) {
+      statusBarItem.text =
+        `$(error) envpact: ${lastResolveError.keys.length} enc: secret(s) — cannot decrypt`;
+      statusBarItem.tooltip = lastResolveError.message;
+      // VS Code only ships one warning/error background colour pair on
+      // the status bar; pick the error one when we're in this state.
+      statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+    } else {
+      statusBarItem.text = `$(lock) envpact: ${project || 'ready'}`;
+      statusBarItem.tooltip = `envpact vault at ${SECRETS_DIR}\nClick to generate .env`;
+      statusBarItem.backgroundColor = undefined;
+    }
   } else {
     statusBarItem.text = '$(unlock) envpact: not initialized';
     statusBarItem.tooltip = 'Run envpact: Initialize Vault';
+    statusBarItem.backgroundColor = undefined;
   }
   statusBarItem.show();
 }
 
 function refreshAll() {
+  if (projectsProvider) projectsProvider.setResolveError(lastResolveError);
   projectsProvider.refresh();
   sharedProvider.refresh();
   refreshStatusBar();
@@ -118,18 +154,56 @@ async function generateEnvCommand() {
 
     const vault = loadVault();
     const result = resolveProject(vault, project, environment || undefined);
+
+    // Bail BEFORE writing .env if the resolver flagged any encrypted
+    // leaves: we have no age private key here, so the literal `enc:...`
+    // would otherwise leak into the file. Surface the failure on the
+    // status bar, sidebar, and via a toast that exposes the same
+    // recovery actions syncGitHubCommand uses.
+    const failure = pickEncryptionFailure(result);
+    if (failure) {
+      const message = formatEncryptionErrorMessage(project, result.environment, failure);
+      lastResolveError = {
+        project,
+        environment: result.environment,
+        keys: failure.keys,
+        message,
+      };
+      refreshAll();
+      const choice = await vscode.window.showErrorMessage(
+        message,
+        'Run envpact-cli',
+        'Show in Vault'
+      );
+      if (choice === 'Run envpact-cli') {
+        const term = vscode.window.createTerminal({ name: 'envpact generate' });
+        term.show();
+        term.sendText('npx envpact-cli');
+      } else if (choice === 'Show in Vault') {
+        await vscode.commands.executeCommand('envpact.projects.focus');
+      }
+      return;
+    }
+
+    // Defensive: even if pickEncryptionFailure returned null (no encrypted
+    // keys), stripEncrypted is a no-op. Keep it on the success path so
+    // future resolver changes that mark partial successes don't quietly
+    // leak ciphertext into a .env.
+    const safe = stripEncrypted(result);
+    clearResolveError();
+
     const examplePath = path.join(cwd, '.env.example');
     const required = parseEnvExample(examplePath);
-    const ordered = required.length ? required : Object.keys(result.resolved);
-    const content = renderEnv(ordered, result.resolved, { project, environment: result.environment });
+    const ordered = required.length ? required : Object.keys(safe.resolved);
+    const content = renderEnv(ordered, safe.resolved, { project, environment: safe.environment });
 
     const out = path.join(cwd, '.env');
     writeEnvAtomic(out, content);
     ensureGitignoreCovers(cwd, '.env');
 
     vscode.window.showInformationMessage(
-      `envpact: wrote ${Object.keys(result.resolved).length} keys to .env (env=${result.environment})` +
-      (result.unresolved.length ? `. Unresolved: ${result.unresolved.join(', ')}` : '')
+      `envpact: wrote ${Object.keys(safe.resolved).length} keys to .env (env=${safe.environment})` +
+      (safe.unresolved.length ? `. Unresolved: ${safe.unresolved.join(', ')}` : '')
     );
     refreshAll();
   } catch (e: any) {
@@ -163,10 +237,16 @@ async function initVaultCommand() {
     if (!url) return;
     term.sendText(`npx envpact-cli --init ${url}`);
   }
+  // Whatever was wrong before, an init flow makes the previous failure
+  // stale — wipe it so the UI doesn't lie about the new vault.
+  clearResolveError();
   vscode.window.showInformationMessage('envpact: initialisation started in terminal. Run "envpact: Refresh Vault" when done.');
 }
 
 async function refreshVaultCommand() {
+  // A fresh pull may bring in new plaintext or rotate the encrypted
+  // values, so the previous error is no longer authoritative.
+  clearResolveError();
   const r = pullVault();
   if (r.ok) vscode.window.showInformationMessage('envpact: vault pulled');
   else vscode.window.showWarningMessage(`envpact: ${r.error}`);

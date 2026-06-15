@@ -1,6 +1,18 @@
 import * as vscode from 'vscode';
 import { vaultExists, loadVault, isEncrypted } from './vault';
-import { listProjectEnvironments } from './resolver';
+import { listProjectEnvironments, ENC_PREFIX } from './resolver';
+
+/**
+ * Shape pushed into the sidebar by extension.ts when generateEnv hits
+ * encrypted leaves. The provider uses this to surface a synthetic node
+ * under the affected project and to colour the project icon.
+ */
+export interface ResolveErrorState {
+  project: string;
+  environment: string;
+  keys: string[];
+  message: string;
+}
 
 class TreeItem extends vscode.TreeItem {
   constructor(label: string, collapsibleState: vscode.TreeItemCollapsibleState, public readonly children?: TreeItem[]) {
@@ -8,11 +20,33 @@ class TreeItem extends vscode.TreeItem {
   }
 }
 
+/**
+ * Returns true when the raw vault entry encodes (or could encode) an
+ * encrypted leaf — either directly as a `enc:...` string, or as a
+ * per-environment object whose values include an encrypted override.
+ */
+function isEncryptedEntry(raw: unknown): boolean {
+  if (typeof raw === 'string') return raw.startsWith(ENC_PREFIX);
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const v of Object.values(raw as Record<string, unknown>)) {
+      if (typeof v === 'string' && v.startsWith(ENC_PREFIX)) return true;
+    }
+  }
+  return false;
+}
+
 export class ProjectsTreeProvider implements vscode.TreeDataProvider<TreeItem> {
   private _onDidChangeTreeData = new vscode.EventEmitter<TreeItem | undefined | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+  private resolveError: ResolveErrorState | null = null;
 
   refresh(): void {
+    this._onDidChangeTreeData.fire();
+  }
+
+  /** Push (or clear with null) the most recent resolve error. */
+  setResolveError(err: ResolveErrorState | null): void {
+    this.resolveError = err;
     this._onDidChangeTreeData.fire();
   }
 
@@ -29,24 +63,70 @@ export class ProjectsTreeProvider implements vscode.TreeDataProvider<TreeItem> {
     }
     try {
       const vault = loadVault();
+      const errState = this.resolveError;
       return Object.keys(vault.projects || {})
         .sort()
         .map((name) => {
           const project = vault.projects![name];
-          const keyCount = Object.keys(project).filter((k) => !k.startsWith('_')).length;
+          const projectKeys = Object.keys(project).filter((k) => !k.startsWith('_'));
+          const keyCount = projectKeys.length;
           const envs = listProjectEnvironments(vault, name);
+          const errorMatchesProject = errState && errState.project === name;
+
+          const leafChildren: TreeItem[] = projectKeys.map((k) => {
+            const raw = project[k];
+            if (isEncryptedEntry(raw)) {
+              const child = new TreeItem(
+                `${k} = (encrypted — not decryptable in VS Code)`,
+                vscode.TreeItemCollapsibleState.None
+              );
+              const icon = new vscode.ThemeIcon(
+                'shield',
+                new vscode.ThemeColor('errorForeground')
+              );
+              child.iconPath = icon;
+              child.tooltip =
+                `${k} is stored encrypted (enc:...). The VS Code extension does ` +
+                `not hold the age private key — run envpact-cli locally to ` +
+                `generate the .env, or rotate the value via the CLI.`;
+              child.contextValue = 'envpactEncryptedLeaf';
+              return child;
+            }
+            const child = new TreeItem(`${k} = ****`, vscode.TreeItemCollapsibleState.None);
+            child.iconPath = new vscode.ThemeIcon('lock');
+            return child;
+          });
+
+          // When the most recent generate-env hit encrypted leaves on
+          // *this* project, prepend a synthetic banner child so the
+          // remediation surfaces inline alongside the keys.
+          const children: TreeItem[] = [];
+          if (errorMatchesProject) {
+            const banner = new TreeItem(
+              `cannot decrypt: ${errState!.keys.join(', ')} (env=${errState!.environment || 'default'})`,
+              vscode.TreeItemCollapsibleState.None
+            );
+            banner.iconPath = new vscode.ThemeIcon(
+              'error',
+              new vscode.ThemeColor('errorForeground')
+            );
+            banner.tooltip = errState!.message;
+            banner.contextValue = 'envpactResolveError';
+            children.push(banner);
+          }
+          children.push(...leafChildren);
+
           const item = new TreeItem(
             `${name}  (${keyCount} keys${envs.length ? `, ${envs.join('/')}` : ''})`,
             vscode.TreeItemCollapsibleState.Collapsed,
-            Object.keys(project)
-              .filter((k) => !k.startsWith('_'))
-              .map((k) => {
-                const child = new TreeItem(`${k} = ****`, vscode.TreeItemCollapsibleState.None);
-                child.iconPath = new vscode.ThemeIcon('lock');
-                return child;
-              })
+            children
           );
-          item.iconPath = new vscode.ThemeIcon('folder');
+          if (errorMatchesProject) {
+            item.iconPath = new vscode.ThemeIcon('folder', new vscode.ThemeColor('errorForeground'));
+            item.tooltip = errState!.message;
+          } else {
+            item.iconPath = new vscode.ThemeIcon('folder');
+          }
           item.contextValue = 'envpactProject';
           return item;
         });
