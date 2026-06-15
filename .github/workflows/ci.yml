@@ -23,6 +23,7 @@ jobs:
       - name: Type check + compile
         run: node node_modules/typescript/lib/tsc.js -p ./
       - name: Test
+        shell: bash
         run: node --test --import tsx tests/*.test.ts
       - name: Package (smoke)
         if: matrix.os == 'ubuntu-latest' && matrix.node == '22'
