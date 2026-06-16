@@ -2,7 +2,7 @@
   "name": "envpact",
   "displayName": "envpact",
   "description": "Centralized, serverless secrets manager — manage your private vault visually inside VS Code.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "chirag127",
   "engines": {
     "vscode": "^1.85.0"
@@ -129,13 +129,18 @@
             "dry-run"
           ],
           "enumDescriptions": [
-            "Ask each run (default).",
-            "Always merge: vault values overlay user-edited values; user-only keys preserved.",
+            "Ask each run (legacy v0.3.0 behaviour).",
+            "Always merge: vault values overlay user-edited values; user-only keys preserved (default).",
             "Always overwrite: vault contents replace the target file; user-only keys are lost.",
             "Always dry-run: print the plan, never touch disk."
           ],
-          "default": "ask",
-          "description": "How to handle an existing target file when generating .env."
+          "default": "merge",
+          "description": "How to handle an existing target file when generating .env. v0.4.0 default is 'merge' — never destroys user data. Set to 'ask' to bring back the v0.3.0 prompt."
+        },
+        "envpact.autoSyncOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-push changes to your vault whenever you save a .env file. Local values overwrite remote on conflict; remote-only keys are preserved; new local keys are promoted to the SHARED namespace."
         }
       }
     },

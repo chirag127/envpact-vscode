@@ -1,5 +1,68 @@
 # Changelog
 
+## [0.4.0] - 2026-06-16
+
+### Changed (silent UX rewrite)
+
+- **Zero-prompt setup.** First activation in a workspace now silently
+  detects your GitHub username (via `gh api user`) and the repo name
+  (via `git remote get-url origin`) and caches them in
+  `.vscode/envpact.json`. Subsequent activations are instant. The
+  Generate `.env` command no longer asks you to pick a source file,
+  target file, or write mode — it picks the canonical pair
+  (`.env.example` → `.env`) by convention and merges by default. You
+  only see a prompt if `gh` is missing AND the workspace isn't a
+  github.com git repo.
+- **Project names are now `<username>/<repo>`** (e.g.
+  `chirag127/envpact`) instead of just `<repo>`. Multiple users can
+  share a project name without colliding in the same vault, which is
+  required for shared/team vaults. Existing single-name projects
+  still resolve via the legacy detector as a fallback.
+- **`envpact.writeMode` default is now `merge`** instead of `ask`.
+  v0.3.0's QuickPick-on-every-run friction was the wrong tradeoff;
+  merge is the only mode that can never destroy user data, so it's
+  the right default. Pin to `ask` to bring the v0.3.0 prompt back.
+
+### Added
+
+- **Auto-sync on `.env` save.** When you save `.env`, the extension
+  pushes changes to the vault automatically (debounced 500ms). The
+  conflict policy is:
+  - Local values overwrite remote on key collision
+  - Remote-only keys are preserved (never deleted)
+  - Brand-new local keys are promoted to the SHARED namespace so
+    they're available across every project on every machine
+  - `shared.*` references update the shared value, not the reference
+- **`envpact.autoSyncOnSave`** setting (default `true`) — turn auto-
+  sync off if you want manual control.
+- **`src/setup.ts`** — silent first-run discovery via `gh` CLI + git
+  remote.
+- **`src/sync.ts`** — `pushLocalEnvToVault` with full conflict
+  policy.
+- **`src/watcher.ts`** — `onDidSaveTextDocument` listener that
+  pushes only when `.env` (the canonical file) is saved. Other
+  `.env*` files are still derived-only.
+- **10 new unit tests** for the sync logic (28 total tests, all
+  passing).
+
+### Migration from 0.3.0
+
+If you want the v0.3.0 always-prompt UX back, set in your
+`.vscode/settings.json`:
+
+```jsonc
+{
+  "envpact.writeMode": "ask",
+  "envpact.autoSyncOnSave": false
+}
+```
+
+To clear the cached workspace setup and force re-detection:
+
+```bash
+rm .vscode/envpact.json
+```
+
 ## [0.3.0] - 2026-06-16
 
 ### Changed (BREAKING but corrective)

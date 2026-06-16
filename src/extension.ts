@@ -43,6 +43,8 @@ import {
   stripEncrypted,
   formatEncryptionErrorMessage,
 } from './encryption-guard';
+import { ensureWorkspaceSetup, WorkspaceSetup } from './setup';
+import { registerEnvSaveWatcher } from './watcher';
 
 const execFileP = promisify(execFile);
 
@@ -56,6 +58,13 @@ let statusBarItem: vscode.StatusBarItem;
  * when triggered by sidebar refresh, workspace folder changes, etc.
  */
 let lastResolveError: ResolveErrorState | null = null;
+
+/**
+ * Cached workspace setup (gh username + git repo + project name).
+ * Populated by ensureWorkspaceSetup on activation; consulted by
+ * the .env save watcher and generateEnvCommand without re-prompting.
+ */
+let cachedSetup: WorkspaceSetup | null = null;
 
 function clearResolveError(): void {
   if (lastResolveError === null) return;
@@ -87,9 +96,22 @@ export function activate(context: vscode.ExtensionContext) {
     // longer applies — clear it so the sidebar/statusBar refresh.
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       clearResolveError();
+      cachedSetup = null;        // re-detect on next generate
       refreshAll();
     })
   );
+
+  // Silent first-run discovery: gh username + git remote → project name.
+  // Cached in .vscode/envpact.json so subsequent activations are instant.
+  // The watcher needs this synchronously, so we kick it off and register
+  // the save watcher with a getter that consults the populated cache.
+  const ws0 = vscode.workspace.workspaceFolders?.[0];
+  if (ws0) {
+    ensureWorkspaceSetup(ws0.uri.fsPath)
+      .then((s) => { cachedSetup = s; })
+      .catch(() => { /* user cancelled — generateEnv will retry */ });
+  }
+  registerEnvSaveWatcher(context, () => cachedSetup?.projectName ?? '');
 }
 
 export function deactivate() { /* no-op */ }
@@ -143,7 +165,17 @@ async function generateEnvCommand() {
       return;
     }
     const cwd = ws.uri.fsPath;
-    const project = detectProjectFromGit(cwd);
+    // Use the cached setup (silent gh + git detection). Falls back to
+    // the legacy detectProjectFromGit if anything went wrong upstream.
+    if (!cachedSetup) {
+      try {
+        cachedSetup = await ensureWorkspaceSetup(cwd);
+      } catch {
+        // User cancelled the setup prompt — bail.
+        return;
+      }
+    }
+    const project = cachedSetup.projectName || detectProjectFromGit(cwd);
 
     const cfg = vscode.workspace.getConfiguration('envpact');
     const defaultEnv = cfg.get<string>('defaultEnvironment', 'default');
@@ -203,66 +235,35 @@ async function generateEnvCommand() {
     clearResolveError();
 
     // ── File discovery + source/target prompts ────────────────────────
-    // The vault gives us KEY=VALUE pairs. We still need to decide:
-    //   (a) which .env.example to use as the spec for which keys belong
-    //       in the output, and
-    //   (b) which target file to write (.env, .env.production, …).
-    //
-    // Default to settings if the user pinned them; otherwise scan the
-    // workspace and ask, pre-selecting sensible defaults.
+    // v0.4.0 ZERO-PROMPT BEHAVIOUR:
+    //   - exampleFile/outputFile setting? Use it.
+    //   - Else, scan the workspace and pick by convention:
+    //       * .env.example → .env (the most common pair)
+    //       * if no .env.example, derive from vault keys directly
+    //   - We never QuickPick the user any more. They can override
+    //     by editing .vscode/settings.json once.
     const exampleSetting = cfg.get<string>('exampleFile', '').trim();
     const outputSetting = cfg.get<string>('outputFile', '').trim();
 
     const scan = discoverEnvFiles(cwd);
     let exampleName = exampleSetting;
-    if (!exampleName) {
-      const choices = scan.examples.length
-        ? [...scan.examples, 'Custom…', 'Skip (use vault keys directly)']
-        : ['Custom…', 'Skip (use vault keys directly)'];
-      const pick = await vscode.window.showQuickPick(choices, {
-        placeHolder: 'Pick the .env.example file to use as the spec',
-        ignoreFocusOut: true,
-      });
-      if (!pick) return;
-      if (pick === 'Custom…') {
-        exampleName = (await vscode.window.showInputBox({
-          prompt: 'Path (relative to workspace) of the example file',
-          value: '.env.example',
-          ignoreFocusOut: true,
-        }))?.trim() ?? '';
-        if (!exampleName) return;
-      } else if (pick === 'Skip (use vault keys directly)') {
-        exampleName = '';
-      } else {
-        exampleName = pick;
+    if (!exampleName && scan.examples.length) {
+      // Convention: the first example file in sort order is .env.example,
+      // followed by environment-specific examples. Match the active env
+      // if possible (e.g. environment === 'production' picks
+      // .env.production.example), otherwise default to the first.
+      if (environment) {
+        const envSpecific = scan.examples.find((e) =>
+          e === `.env.${environment}.example`
+        );
+        if (envSpecific) exampleName = envSpecific;
       }
+      if (!exampleName) exampleName = scan.examples[0];
     }
 
     let outputName = outputSetting;
     if (!outputName) {
-      const suggested = exampleName ? suggestTargetFor(exampleName) : '.env';
-      const targetChoices = Array.from(new Set([
-        suggested,
-        ...scan.targets,
-        '.env',
-        '.env.local',
-      ])).filter(Boolean);
-      targetChoices.push('Custom…');
-      const pick = await vscode.window.showQuickPick(targetChoices, {
-        placeHolder: `Pick the target file (default: ${suggested})`,
-        ignoreFocusOut: true,
-      });
-      if (!pick) return;
-      if (pick === 'Custom…') {
-        outputName = (await vscode.window.showInputBox({
-          prompt: 'Path (relative to workspace) of the target file',
-          value: suggested,
-          ignoreFocusOut: true,
-        }))?.trim() ?? '';
-        if (!outputName) return;
-      } else {
-        outputName = pick;
-      }
+      outputName = exampleName ? suggestTargetFor(exampleName) : '.env';
     }
 
     const examplePath = exampleName ? path.join(cwd, exampleName) : '';
@@ -271,16 +272,17 @@ async function generateEnvCommand() {
     const out = path.join(cwd, outputName);
 
     // ── Write mode (Merge / Overwrite / Dry-run) ──────────────────────
-    // Merge is the safe default: keys the user has in their .env that
-    // the vault doesn't know about are preserved. Overwrite reproduces
-    // the prior behaviour but only after the user sees what they'll
-    // lose. Dry-run shows the diff without touching disk.
+    // v0.4.0: 'ask' is no longer the default — 'merge' is. The whole
+    // point of v0.4.0 is zero prompts, and merge can never destroy
+    // user data. The user can still override via the writeMode setting
+    // if they want overwrite or dry-run behaviour.
     const writeModeSetting = cfg.get<string>(
       'writeMode',
-      'ask',
+      'merge',
     ) as 'ask' | 'merge' | 'overwrite' | 'dry-run';
     let writeMode: 'merge' | 'overwrite' | 'dry-run';
     if (writeModeSetting === 'ask') {
+      // Legacy: still honoured if pinned, but no longer the default.
       const pickMode = await vscode.window.showQuickPick(
         [
           { label: 'Merge', description: 'Vault values overlay your .env; user-only keys preserved (recommended)' },
