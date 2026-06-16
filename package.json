@@ -2,7 +2,7 @@
   "name": "envpact",
   "displayName": "envpact",
   "description": "Centralized, serverless secrets manager — manage your private vault visually inside VS Code.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "chirag127",
   "engines": {
     "vscode": "^1.85.0"
@@ -109,6 +109,33 @@
           "type": "boolean",
           "default": true,
           "description": "Auto-pull the vault repo before generating .env."
+        },
+        "envpact.exampleFile": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace-relative path of the .env.example to use as the spec. Leave empty to scan and prompt."
+        },
+        "envpact.outputFile": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace-relative path of the target .env file to write. Leave empty to scan and prompt (default: .env, or the convention-paired target for the chosen example)."
+        },
+        "envpact.writeMode": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "merge",
+            "overwrite",
+            "dry-run"
+          ],
+          "enumDescriptions": [
+            "Ask each run (default).",
+            "Always merge: vault values overlay user-edited values; user-only keys preserved.",
+            "Always overwrite: vault contents replace the target file; user-only keys are lost.",
+            "Always dry-run: print the plan, never touch disk."
+          ],
+          "default": "ask",
+          "description": "How to handle an existing target file when generating .env."
         }
       }
     },

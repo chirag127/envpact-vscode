@@ -3,6 +3,11 @@ import * as path from 'node:path';
 
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * Parse a .env.example file: return the ordered list of keys it
+ * declares. Comments, blank lines, and malformed entries are skipped.
+ * Used as the spec for which keys the generated .env should contain.
+ */
 export function parseEnvExample(filePath: string): string[] {
   if (!fs.existsSync(filePath)) return [];
   const keys: string[] = [];
@@ -15,6 +20,49 @@ export function parseEnvExample(filePath: string): string[] {
     if (KEY_RE.test(key) && !keys.includes(key)) keys.push(key);
   }
   return keys;
+}
+
+/**
+ * Parse an existing .env into a flat record of KEY -> raw VALUE.
+ * Strips matching outer quotes and unescapes \n / \r / \t / \\ / \"
+ * so callers see the original byte sequence the user committed.
+ *
+ * Comments and blank lines are dropped — callers that want to
+ * preserve them should keep the original file string and use
+ * mergeEnvFile instead, which is comment-preserving.
+ */
+export function parseEnvFile(filePath: string): Record<string, string> {
+  if (!fs.existsSync(filePath)) return {};
+  const out: Record<string, string> = {};
+  for (const raw of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!KEY_RE.test(key)) continue;
+    let value = line.slice(eq + 1).trim();
+    // Strip a single set of matching outer quotes.
+    if (
+      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+    ) {
+      const quote = value[0];
+      value = value.slice(1, -1);
+      if (quote === '"') {
+        // Unescape JSON-ish sequences only inside double-quoted values
+        // (single-quoted .env values are conventionally raw).
+        value = value
+          .replace(/\\\\/g, '\\')
+          .replace(/\\"/g, '"')
+          .replace(/\\n/g, '\n')
+          .replace(/\\r/g, '\r')
+          .replace(/\\t/g, '\t');
+      }
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 function needsQuoting(v: string): boolean {
@@ -51,6 +99,100 @@ export function renderEnv(
   return lines.join('\n') + '\n';
 }
 
+/**
+ * Result of a merge plan against an existing .env file. Callers use
+ * this to render a confirmation UI before any disk write.
+ *
+ *  - kept:        keys present in the existing file but NOT in the
+ *                 vault output. Merge mode preserves these verbatim;
+ *                 overwrite mode loses them.
+ *  - overwritten: keys present in both; vault value wins.
+ *  - added:       keys in the vault output but not yet in the file.
+ *  - unchanged:   keys whose vault value already matches the file
+ *                 (no real diff).
+ */
+export interface MergePlan {
+  kept: string[];
+  overwritten: string[];
+  added: string[];
+  unchanged: string[];
+}
+
+export function planMerge(
+  existing: Record<string, string>,
+  incoming: Record<string, string>,
+): MergePlan {
+  const kept: string[] = [];
+  const overwritten: string[] = [];
+  const added: string[] = [];
+  const unchanged: string[] = [];
+  for (const k of Object.keys(existing)) {
+    if (!(k in incoming)) kept.push(k);
+    else if (existing[k] === incoming[k]) unchanged.push(k);
+    else overwritten.push(k);
+  }
+  for (const k of Object.keys(incoming)) {
+    if (!(k in existing)) added.push(k);
+  }
+  kept.sort(); overwritten.sort(); added.sort(); unchanged.sort();
+  return { kept, overwritten, added, unchanged };
+}
+
+/**
+ * Comment-preserving merge of an existing .env's text content with a
+ * map of incoming KEY=value pairs. For each key in `incoming`, the
+ * matching `KEY=` line in the existing text is replaced with the new
+ * value (formatted via formatValue). New keys are appended in
+ * `orderedNew` order under a `# Added by envpact-vscode` header.
+ *
+ * Lines that are NOT keys in `incoming` (comments, blank lines, keys
+ * the user has but the vault doesn't) are kept verbatim. This is the
+ * safe default: nothing the user typed is silently destroyed.
+ *
+ * If the target file does not exist this returns the same output as
+ * renderEnv with the full ordered key list.
+ */
+export function mergeEnvFile(
+  existingText: string,
+  incoming: Record<string, string>,
+  orderedNew: string[],
+): string {
+  const lines = existingText.split(/\r?\n/);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of lines) {
+    const line = raw;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      out.push(line);
+      continue;
+    }
+    const eq = trimmed.indexOf('=');
+    if (eq < 0) { out.push(line); continue; }
+    const key = trimmed.slice(0, eq).trim();
+    if (!KEY_RE.test(key) || !(key in incoming)) {
+      out.push(line);
+      continue;
+    }
+    // Replace this line with the vault's value, preserving the
+    // original line's leading whitespace if any.
+    const indent = /^\s*/.exec(line)?.[0] ?? '';
+    out.push(`${indent}${key}=${formatValue(incoming[key])}`);
+    seen.add(key);
+  }
+  // Append keys that were never present in the original file.
+  const toAppend = orderedNew.filter((k) => k in incoming && !seen.has(k));
+  if (toAppend.length) {
+    if (out.length && out[out.length - 1].trim() !== '') out.push('');
+    out.push(`# Added by envpact-vscode on ${new Date().toISOString()}`);
+    for (const k of toAppend) out.push(`${k}=${formatValue(incoming[k])}`);
+  }
+  // Preserve trailing newline if the original had one; otherwise add.
+  let result = out.join('\n');
+  if (!result.endsWith('\n')) result += '\n';
+  return result;
+}
+
 export function writeEnvAtomic(filePath: string, content: string): void {
   const dir = path.dirname(path.resolve(filePath));
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -67,4 +209,89 @@ export function ensureGitignoreCovers(cwd: string, pattern: string): boolean {
   const next = (existing && !existing.endsWith('\n') ? existing + '\n' : existing) + pattern + '\n';
   fs.writeFileSync(file, next);
   return true;
+}
+
+/**
+ * Discover candidate .env-style files in a workspace directory,
+ * partitioned into "examples" (templates that declare keys) and
+ * "targets" (destinations for the generated values). Non-recursive
+ * by design — these conventionally live at the repo root.
+ *
+ * Examples matched: .env.example, .env.<env>.example, env.example.
+ * Targets matched : .env, .env.<env>, .env.local.
+ *
+ * Files with .sample / .template / .dist suffixes are also captured
+ * as examples — common alternatives in the wild.
+ */
+export interface EnvFileScan {
+  examples: string[];
+  targets: string[];
+}
+
+export function discoverEnvFiles(cwd: string): EnvFileScan {
+  const examples = new Set<string>();
+  const targets = new Set<string>();
+  let entries: string[] = [];
+  try { entries = fs.readdirSync(cwd); } catch (_e) { return { examples: [], targets: [] }; }
+  for (const name of entries) {
+    // Skip directories quickly.
+    let st: fs.Stats;
+    try { st = fs.statSync(path.join(cwd, name)); } catch (_e) { continue; }
+    if (!st.isFile()) continue;
+    if (looksLikeExample(name)) examples.add(name);
+    else if (looksLikeTarget(name)) targets.add(name);
+  }
+  return {
+    examples: [...examples].sort(exampleSort),
+    targets: [...targets].sort(targetSort),
+  };
+}
+
+function looksLikeExample(name: string): boolean {
+  // .env.example, .env.development.example, env.example
+  if (/^\.?env(\..+)?\.(example|sample|template|dist)$/i.test(name)) return true;
+  // env.example (no leading dot — Next.js / Astro conventions)
+  if (/^env\.(example|sample|template|dist)$/i.test(name)) return true;
+  return false;
+}
+
+function looksLikeTarget(name: string): boolean {
+  // .env, .env.local, .env.production, .env.development.local
+  if (!/^\.env(\.[a-zA-Z0-9_-]+)*$/.test(name)) return false;
+  // Don't classify a *.example as a target.
+  if (/\.(example|sample|template|dist)$/i.test(name)) return false;
+  return true;
+}
+
+// Sort .env.example before .env.<env>.example, then alphabetically.
+function exampleSort(a: string, b: string): number {
+  if (a === '.env.example') return -1;
+  if (b === '.env.example') return 1;
+  return a.localeCompare(b);
+}
+
+// Sort .env first, then .env.local, then alphabetically.
+function targetSort(a: string, b: string): number {
+  if (a === '.env') return -1;
+  if (b === '.env') return 1;
+  if (a === '.env.local') return -1;
+  if (b === '.env.local') return 1;
+  return a.localeCompare(b);
+}
+
+/**
+ * Pair an example filename with the conventional target. Used to
+ * pre-select a sensible default when the user is asked which target
+ * to write.
+ *
+ *   .env.example                  → .env
+ *   .env.production.example       → .env.production
+ *   .env.development.example      → .env.development
+ *   env.example (Next.js)         → .env.local
+ */
+export function suggestTargetFor(exampleName: string): string {
+  const m = /^\.env\.(.+)\.(example|sample|template|dist)$/i.exec(exampleName);
+  if (m) return `.env.${m[1]}`;
+  if (/^env\.(example|sample|template|dist)$/i.test(exampleName)) return '.env.local';
+  return '.env';
 }

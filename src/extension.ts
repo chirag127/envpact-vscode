@@ -26,7 +26,17 @@ import {
   SECRETS_FILE,
 } from './vault';
 import { resolveProject } from './resolver';
-import { parseEnvExample, renderEnv, writeEnvAtomic, ensureGitignoreCovers } from './envwriter';
+import {
+  parseEnvExample,
+  parseEnvFile,
+  renderEnv,
+  mergeEnvFile,
+  planMerge,
+  writeEnvAtomic,
+  ensureGitignoreCovers,
+  discoverEnvFiles,
+  suggestTargetFor,
+} from './envwriter';
 import { ProjectsTreeProvider, SharedTreeProvider, ResolveErrorState } from './sidebar';
 import {
   pickEncryptionFailure,
@@ -192,17 +202,141 @@ async function generateEnvCommand() {
     const safe = stripEncrypted(result);
     clearResolveError();
 
-    const examplePath = path.join(cwd, '.env.example');
-    const required = parseEnvExample(examplePath);
+    // ── File discovery + source/target prompts ────────────────────────
+    // The vault gives us KEY=VALUE pairs. We still need to decide:
+    //   (a) which .env.example to use as the spec for which keys belong
+    //       in the output, and
+    //   (b) which target file to write (.env, .env.production, …).
+    //
+    // Default to settings if the user pinned them; otherwise scan the
+    // workspace and ask, pre-selecting sensible defaults.
+    const exampleSetting = cfg.get<string>('exampleFile', '').trim();
+    const outputSetting = cfg.get<string>('outputFile', '').trim();
+
+    const scan = discoverEnvFiles(cwd);
+    let exampleName = exampleSetting;
+    if (!exampleName) {
+      const choices = scan.examples.length
+        ? [...scan.examples, 'Custom…', 'Skip (use vault keys directly)']
+        : ['Custom…', 'Skip (use vault keys directly)'];
+      const pick = await vscode.window.showQuickPick(choices, {
+        placeHolder: 'Pick the .env.example file to use as the spec',
+        ignoreFocusOut: true,
+      });
+      if (!pick) return;
+      if (pick === 'Custom…') {
+        exampleName = (await vscode.window.showInputBox({
+          prompt: 'Path (relative to workspace) of the example file',
+          value: '.env.example',
+          ignoreFocusOut: true,
+        }))?.trim() ?? '';
+        if (!exampleName) return;
+      } else if (pick === 'Skip (use vault keys directly)') {
+        exampleName = '';
+      } else {
+        exampleName = pick;
+      }
+    }
+
+    let outputName = outputSetting;
+    if (!outputName) {
+      const suggested = exampleName ? suggestTargetFor(exampleName) : '.env';
+      const targetChoices = Array.from(new Set([
+        suggested,
+        ...scan.targets,
+        '.env',
+        '.env.local',
+      ])).filter(Boolean);
+      targetChoices.push('Custom…');
+      const pick = await vscode.window.showQuickPick(targetChoices, {
+        placeHolder: `Pick the target file (default: ${suggested})`,
+        ignoreFocusOut: true,
+      });
+      if (!pick) return;
+      if (pick === 'Custom…') {
+        outputName = (await vscode.window.showInputBox({
+          prompt: 'Path (relative to workspace) of the target file',
+          value: suggested,
+          ignoreFocusOut: true,
+        }))?.trim() ?? '';
+        if (!outputName) return;
+      } else {
+        outputName = pick;
+      }
+    }
+
+    const examplePath = exampleName ? path.join(cwd, exampleName) : '';
+    const required = examplePath ? parseEnvExample(examplePath) : [];
     const ordered = required.length ? required : Object.keys(safe.resolved);
-    const content = renderEnv(ordered, safe.resolved, { project, environment: safe.environment });
+    const out = path.join(cwd, outputName);
 
-    const out = path.join(cwd, '.env');
+    // ── Write mode (Merge / Overwrite / Dry-run) ──────────────────────
+    // Merge is the safe default: keys the user has in their .env that
+    // the vault doesn't know about are preserved. Overwrite reproduces
+    // the prior behaviour but only after the user sees what they'll
+    // lose. Dry-run shows the diff without touching disk.
+    const writeModeSetting = cfg.get<string>(
+      'writeMode',
+      'ask',
+    ) as 'ask' | 'merge' | 'overwrite' | 'dry-run';
+    let writeMode: 'merge' | 'overwrite' | 'dry-run';
+    if (writeModeSetting === 'ask') {
+      const pickMode = await vscode.window.showQuickPick(
+        [
+          { label: 'Merge', description: 'Vault values overlay your .env; user-only keys preserved (recommended)' },
+          { label: 'Overwrite', description: 'Replace target file with vault contents — user-only keys are lost' },
+          { label: 'Dry run', description: 'Show what would change; do not write' },
+        ],
+        { placeHolder: `Write mode for ${outputName}`, ignoreFocusOut: true }
+      );
+      if (!pickMode) return;
+      writeMode = pickMode.label === 'Merge'
+        ? 'merge'
+        : pickMode.label === 'Overwrite'
+          ? 'overwrite'
+          : 'dry-run';
+    } else {
+      writeMode = writeModeSetting;
+    }
+
+    const existingText = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
+    const existingMap = existingText ? parseEnvFile(out) : {};
+    const plan = planMerge(existingMap, safe.resolved);
+
+    if (writeMode === 'overwrite' && plan.kept.length > 0) {
+      const proceed = await vscode.window.showWarningMessage(
+        `Overwriting ${outputName} will discard ${plan.kept.length} key(s) not present in the vault: ${plan.kept.slice(0, 8).join(', ')}${plan.kept.length > 8 ? `, +${plan.kept.length - 8} more` : ''}. Continue?`,
+        { modal: true },
+        'Overwrite anyway',
+        'Switch to Merge',
+      );
+      if (proceed === 'Switch to Merge') writeMode = 'merge';
+      else if (proceed !== 'Overwrite anyway') return;
+    }
+
+    if (writeMode === 'dry-run') {
+      vscode.window.showInformationMessage(
+        `envpact (dry run) ${outputName}: +${plan.added.length} added, ${plan.overwritten.length} overwritten, ${plan.kept.length} preserved, ${plan.unchanged.length} unchanged.`
+      );
+      refreshAll();
+      return;
+    }
+
+    let content: string;
+    if (writeMode === 'merge' && existingText) {
+      content = mergeEnvFile(existingText, safe.resolved, ordered);
+    } else {
+      content = renderEnv(ordered, safe.resolved, { project, environment: safe.environment });
+    }
+
     writeEnvAtomic(out, content);
-    ensureGitignoreCovers(cwd, '.env');
+    ensureGitignoreCovers(cwd, outputName);
 
+    const summary = writeMode === 'merge' && existingText
+      ? `merged into ${outputName}: +${plan.added.length}, ~${plan.overwritten.length}, kept ${plan.kept.length} user key(s)`
+      : `wrote ${Object.keys(safe.resolved).length} keys to ${outputName} (env=${safe.environment})`;
     vscode.window.showInformationMessage(
-      `envpact: wrote ${Object.keys(safe.resolved).length} keys to .env (env=${safe.environment})` +
+      `envpact: ${summary}` +
       (safe.unresolved.length ? `. Unresolved: ${safe.unresolved.join(', ')}` : '')
     );
     refreshAll();
