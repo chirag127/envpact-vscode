@@ -43,7 +43,14 @@ import {
 import { ensureWorkspaceSetup, WorkspaceSetup } from './setup';
 import { registerEnvSaveWatcher } from './watcher';
 import { openSyncPanel, runPullKey, runPushKey } from './syncPanel';
-import { resolveVaultEntry } from './sync';
+import {
+  resolveVaultEntry,
+  getKeyStatus,
+  loadLock,
+  Lock,
+  KeyStatus,
+} from './sync';
+import { renderConflictBlock } from './timestamps';
 
 let projectsProvider: ProjectsTreeProvider;
 let sharedProvider: SharedTreeProvider;
@@ -183,14 +190,33 @@ async function confirmAndDispatch(
   // are the most a user-facing prompt is allowed to reveal — and even
   // that only when length ≥ 8. Shorter values collapse to ••••.
   let preview = '';
+  let conflictBlock = '';
   try {
+    const vault = loadVault();
+    const entry = resolveVaultEntry(vault, ctx.project, ctx.key);
+    const localMap = parseEnvFile(path.join(wsRoot, '.env'));
     if (direction === 'pull') {
-      const vault = loadVault();
-      const entry = resolveVaultEntry(vault, ctx.project, ctx.key);
       preview = entry ? maskValue(entry.value) : '(not in vault)';
     } else {
-      const localMap = parseEnvFile(path.join(wsRoot, '.env'));
       preview = ctx.key in localMap ? maskValue(localMap[ctx.key]) : '(not in .env)';
+    }
+
+    // Compute conflict status so we can render dual timestamps when a
+    // conflict status applies. The lock file lives next to .env.example.
+    let lock: Lock;
+    try {
+      lock = loadLock(path.join(wsRoot, '.env.example'));
+    } catch {
+      lock = { version: 1, keys: {} };
+    }
+    const lockEntry = lock.keys[ctx.key];
+    const status: KeyStatus = getKeyStatus(localMap[ctx.key], entry, lockEntry);
+    if (
+      status === 'local_newer' ||
+      status === 'vault_newer' ||
+      status === 'both_diverged'
+    ) {
+      conflictBlock = formatConflictBlock(ctx.project, ctx.key, entry, lockEntry, status);
     }
   } catch (e: any) {
     vscode.window.showErrorMessage(`envpact: ${e.message}`);
@@ -200,8 +226,13 @@ async function confirmAndDispatch(
   const verb = direction === 'pull' ? 'Pull' : 'Push';
   const target = direction === 'pull' ? 'local .env' : 'vault';
   const forceLabel = force ? ' (force — overrides conflict refusal)' : '';
+  const message =
+    `${verb} ${ctx.key} → ${target}${forceLabel}\n\n` +
+    `Value preview (masked): ${preview}\n` +
+    (conflictBlock ? `\n${conflictBlock}\n` : '') +
+    `\nContinue?`;
   const proceed = await vscode.window.showWarningMessage(
-    `${verb} ${ctx.key} → ${target}${forceLabel}\n\nValue preview (masked): ${preview}\n\nContinue?`,
+    message,
     { modal: true },
     verb,
     'Cancel',
@@ -219,6 +250,31 @@ async function confirmAndDispatch(
     return;
   }
   refreshAll();
+}
+
+/**
+ * Render a SHARED_SPEC §1.5 conflict block: both UTC and IST stamps
+ * for vault and local sides, with "(Recommended — newer)" annotating
+ * whichever side is newer. The `lockEntry.synced_at` is when the user
+ * last took the sync action — that's the "local" timestamp baseline
+ * the user recognises in their own workflow.
+ *
+ * The block is purely informational — the user keeps full control.
+ */
+function formatConflictBlock(
+  project: string,
+  key: string,
+  vaultEntry: { value: string; _modified_at: string } | undefined,
+  lockEntry: { vault_modified_at: string | null; synced_at: string } | undefined,
+  status: KeyStatus,
+): string {
+  return renderConflictBlock({
+    project,
+    key,
+    status,
+    vaultIso: vaultEntry?._modified_at || '',
+    localIso: lockEntry?.synced_at || '',
+  });
 }
 
 async function pullKeyFromTree(item: vscode.TreeItem | undefined, force: boolean) {

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { formatTimestamp, newerSide } from '../src/timestamps';
+import { renderConflictBlock, newerSideLabel } from '../src/timestamps';
 
 test('formatTimestamp: round-trips canonical ISO UTC strings', () => {
   const r = formatTimestamp('2026-06-19T07:30:00.000Z');
@@ -64,4 +65,79 @@ test('newerSide: NaN inputs lose to the valid side; NaN+NaN → tie', () => {
   assert.equal(newerSide('garbage', valid), 'b');
   assert.equal(newerSide(valid, 'garbage'), 'a');
   assert.equal(newerSide('garbage', 'also-garbage'), 'tie');
+});
+
+// ── renderConflictBlock ─────────────────────────────────────────────
+
+test('renderConflictBlock: vault newer → vault gets the (Recommended) tag', () => {
+  const text = renderConflictBlock({
+    project: 'my-app',
+    key: 'OPENAI_API_KEY',
+    status: 'vault_newer',
+    vaultIso: '2026-06-19T07:30:00.000Z',
+    localIso: '2026-06-19T07:25:00.000Z',
+  });
+  assert.match(text, /Conflict on KEY = OPENAI_API_KEY/);
+  assert.match(text, /project: my-app/);
+  assert.match(text, /status: vault_newer/);
+  assert.match(text, /Vault:\s+2026-06-19T07:30:00\.000Z/);
+  assert.match(text, /→ 2026-06-19 13:00:00 IST\s+\(Recommended — newer\)/);
+  assert.match(text, /Local:\s+2026-06-19T07:25:00\.000Z/);
+  assert.match(text, /→ 2026-06-19 12:55:00 IST/);
+  // Local must NOT have the recommended tag.
+  const localPart = text.slice(text.indexOf('Local:'));
+  assert.doesNotMatch(localPart, /Recommended/);
+});
+
+test('renderConflictBlock: local newer → local gets the (Recommended) tag', () => {
+  const text = renderConflictBlock({
+    project: 'p',
+    key: 'K',
+    status: 'local_newer',
+    vaultIso: '2026-06-19T07:25:00.000Z',
+    localIso: '2026-06-19T07:30:00.000Z',
+  });
+  const localPart = text.slice(text.indexOf('Local:'));
+  assert.match(localPart, /Recommended — newer/);
+  // Vault portion must NOT have the recommended tag.
+  const vaultPart = text.slice(text.indexOf('Vault:'), text.indexOf('Local:'));
+  assert.doesNotMatch(vaultPart, /Recommended/);
+});
+
+test('renderConflictBlock: missing local timestamp degrades to "(no timestamp)"', () => {
+  const text = renderConflictBlock({
+    project: 'p',
+    key: 'K',
+    status: 'both_diverged',
+    vaultIso: '2026-06-19T07:30:00.000Z',
+    localIso: '',
+  });
+  assert.match(text, /Local:\s+\(no timestamp\)/);
+});
+
+test('renderConflictBlock: unparseable timestamps are surfaced gracefully', () => {
+  const text = renderConflictBlock({
+    project: 'p',
+    key: 'K',
+    status: 'vault_newer',
+    vaultIso: 'not-a-date',
+    localIso: '2026-06-19T07:25:00.000Z',
+  });
+  assert.match(text, /Vault:\s+not-a-date\s+\(unparseable\)/);
+});
+
+// ── newerSideLabel ──────────────────────────────────────────────────
+
+test('newerSideLabel: returns short hint for the panel badge', () => {
+  assert.equal(
+    newerSideLabel('2026-06-19T07:30:00.000Z', '2026-06-19T07:25:00.000Z'),
+    '(newer side: vault)',
+  );
+  assert.equal(
+    newerSideLabel('2026-06-19T07:25:00.000Z', '2026-06-19T07:30:00.000Z'),
+    '(newer side: local)',
+  );
+  assert.equal(newerSideLabel('2026-06-19T07:30:00.000Z', '2026-06-19T07:30:00.000Z'), '');
+  assert.equal(newerSideLabel(null, '2026-06-19T07:30:00.000Z'), '');
+  assert.equal(newerSideLabel('2026-06-19T07:30:00.000Z', null), '');
 });

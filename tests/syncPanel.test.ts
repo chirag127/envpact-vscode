@@ -49,6 +49,24 @@ test('renderPanelHtml: includes Refresh, Pull all, Push all toolbar buttons', ()
   assert.match(html, /id="pushAll"/);
 });
 
+test('renderPanelHtml: ships a client-side IST formatter (Asia/Kolkata)', () => {
+  const html = renderPanelHtml('n', 'vscode-resource:');
+  assert.match(html, /Asia\/Kolkata/);
+  // The toIst helper is what converts UTC ISO → IST display string.
+  assert.match(html, /function toIst/);
+});
+
+test('renderPanelHtml: declares the (newer side: …) hint helper', () => {
+  const html = renderPanelHtml('n', 'vscode-resource:');
+  assert.match(html, /newer side: vault/);
+  assert.match(html, /newer side: local/);
+});
+
+test('renderPanelHtml: column header advertises hover-for-UTC', () => {
+  const html = renderPanelHtml('n', 'vscode-resource:');
+  assert.match(html, /Last modified \(IST — hover for UTC\)/);
+});
+
 // ── maskValue is the only path values can take into the UI ─────────────
 
 test('maskValue: never reveals more than 6 chars total of long values', () => {

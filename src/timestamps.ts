@@ -78,3 +78,67 @@ export function newerSide(a: string, b: string): 'a' | 'b' | 'tie' {
   if (tb > ta) return 'b';
   return 'tie';
 }
+
+/**
+ * Render a SHARED_SPEC §1.5 conflict block as plain text. Pure — used
+ * by VS Code's modal warning prompt and unit-testable in isolation.
+ *
+ *   Conflict on KEY = OPENAI_API_KEY (project: my-app, status: vault_newer)
+ *
+ *     Vault:  2026-06-19T07:30:00.000Z
+ *             → 2026-06-19 13:00:00 IST   (Recommended — newer)
+ *     Local:  2026-06-19T07:25:00.000Z
+ *             → 2026-06-19 12:55:00 IST
+ *
+ * The newer side gets the "(Recommended — newer)" annotation. When
+ * either timestamp is missing or unparseable, that line falls back
+ * gracefully without throwing — the prompt is informational only.
+ */
+export function renderConflictBlock(opts: {
+  project: string;
+  key: string;
+  status: string;
+  vaultIso: string;
+  localIso: string;
+}): string {
+  const { project, key, status, vaultIso, localIso } = opts;
+  const lines: string[] = [
+    `Conflict on KEY = ${key} (project: ${project}, status: ${status})`,
+    '',
+  ];
+
+  let recommend: 'a' | 'b' | 'tie' = 'tie';
+  if (vaultIso && localIso) recommend = newerSide(vaultIso, localIso);
+
+  const renderLine = (label: string, iso: string, isNewer: boolean): string[] => {
+    if (!iso) return [`  ${label}:  (no timestamp)`];
+    let f: FormattedTimestamp;
+    try {
+      f = formatTimestamp(iso);
+    } catch {
+      return [`  ${label}:  ${iso}  (unparseable)`];
+    }
+    const tag = isNewer ? '   (Recommended — newer)' : '';
+    return [
+      `  ${label}:  ${f.utc}`,
+      `          → ${f.ist}${tag}`,
+    ];
+  };
+
+  lines.push(...renderLine('Vault', vaultIso, recommend === 'a'));
+  lines.push(...renderLine('Local', localIso, recommend === 'b'));
+  return lines.join('\n');
+}
+
+/**
+ * Compute a one-line "(newer side: vault)" / "(newer side: local)" /
+ * empty string for the sync panel badge label. Returns "" when there
+ * is no clear newer side (tie / missing input).
+ */
+export function newerSideLabel(vaultIso: string | null, localIso: string | null): string {
+  if (!vaultIso || !localIso) return '';
+  const r = newerSide(vaultIso, localIso);
+  if (r === 'a') return '(newer side: vault)';
+  if (r === 'b') return '(newer side: local)';
+  return '';
+}

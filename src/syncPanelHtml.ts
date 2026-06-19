@@ -12,6 +12,14 @@
  * webview script handles all state interpolation client-side, with
  * inputs that have already been masked host-side.
  *
+ * v3.1: per SHARED_SPEC §1.5 the Last-modified column shows the IST
+ * rendering (recomputed client-side from the canonical UTC ISO) with
+ * the verbatim UTC string in a `title=...` tooltip. The status badge
+ * for conflict statuses gets a small "(newer side: vault|local)" label
+ * so the user can see at a glance which side to accept. Inputs to
+ * the renderer are still pre-masked host-side; the IST conversion
+ * happens here only because the timestamps are not secret data.
+ *
  * CSP:
  *   default-src 'none'
  *   script-src 'nonce-<n>'
@@ -38,6 +46,9 @@ export function renderPanelHtml(nonce: string, cspSource: string): string {
   .badge-both_diverged { background: #dc2626; color: #fff; }
   .badge-local_only { background: #7c3aed; color: #fff; }
   .badge-vault_only { background: #7c3aed; color: #fff; }
+  .newerHint { font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 6px; }
+  .ts { font-family: var(--vscode-editor-font-family); font-size: 11px; }
+  .ts-label { color: var(--vscode-descriptionForeground); margin-right: 4px; }
   button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; padding: 4px 10px; cursor: pointer; margin-right: 4px; border-radius: 3px; font-size: 11px; }
   button:hover { background: var(--vscode-button-hoverBackground); }
   .toolbar { margin: 8px 0; }
@@ -69,6 +80,35 @@ export function renderPanelHtml(nonce: string, cspSource: string): string {
       .replace(/'/g, '&#39;');
   }
 
+  // IST formatter — fixed Asia/Kolkata regardless of host TZ. Same
+  // contract as src/timestamps.ts so users see one canonical IST.
+  const IST_FMT = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
+  function toIst(iso) {
+    if (!iso) return '—';
+    const ms = Date.parse(iso);
+    if (Number.isNaN(ms)) return iso;
+    const parts = IST_FMT.formatToParts(new Date(ms));
+    const get = (t) => { const p = parts.find(x => x.type === t); return p ? p.value : ''; };
+    let h = get('hour'); if (h === '24') h = '00';
+    return get('year') + '-' + get('month') + '-' + get('day') +
+      ' ' + h + ':' + get('minute') + ':' + get('second') + ' IST';
+  }
+  function newerHint(vaultIso, localIso) {
+    if (!vaultIso || !localIso) return '';
+    const tv = Date.parse(vaultIso);
+    const tl = Date.parse(localIso);
+    if (Number.isNaN(tv) || Number.isNaN(tl) || tv === tl) return '';
+    return tv > tl ? '(newer side: vault)' : '(newer side: local)';
+  }
+  function isConflict(s) {
+    return s === 'local_newer' || s === 'vault_newer' || s === 'both_diverged';
+  }
+
   function render(state) {
     document.getElementById('title').textContent =
       state.project ? ('envpact Sync — ' + state.project) : 'envpact Sync Panel';
@@ -85,15 +125,23 @@ export function renderPanelHtml(nonce: string, cspSource: string): string {
       root.innerHTML = '<p class="empty">No keys to display for this project.</p>';
       return;
     }
-    let html = '<table><thead><tr><th>Key</th><th>Status</th><th>Local mtime / Vault mtime</th><th>Preview</th><th>Actions</th></tr></thead><tbody>';
+    let html = '<table><thead><tr><th>Key</th><th>Status</th><th>Last modified (IST — hover for UTC)</th><th>Preview</th><th>Actions</th></tr></thead><tbody>';
     for (const r of state.rows) {
-      const vm = r.vault_modified_at ? new Date(r.vault_modified_at).toLocaleString() : '—';
-      const lm = r.lock_modified_at ? new Date(r.lock_modified_at).toLocaleString() : '—';
       const status = r.status;
+      const vaultIst = toIst(r.vault_modified_at);
+      const localIst = toIst(r.lock_modified_at);
+      const vaultUtc = r.vault_modified_at || '—';
+      const localUtc = r.lock_modified_at || '—';
+      const hint = isConflict(status) ? newerHint(r.vault_modified_at, r.lock_modified_at) : '';
       html += '<tr>'
         + '<td>' + escapeHtml(r.key) + '</td>'
-        + '<td><span class="badge badge-' + escapeHtml(status) + '">' + escapeHtml(status) + '</span></td>'
-        + '<td>local: ' + escapeHtml(lm) + ' / vault: ' + escapeHtml(vm) + '</td>'
+        + '<td><span class="badge badge-' + escapeHtml(status) + '">' + escapeHtml(status) + '</span>'
+        + (hint ? '<span class="newerHint">' + escapeHtml(hint) + '</span>' : '')
+        + '</td>'
+        + '<td class="ts">'
+        + '<span class="ts-label">vault:</span><span title="' + escapeHtml(vaultUtc) + '">' + escapeHtml(vaultIst) + '</span><br>'
+        + '<span class="ts-label">local:</span><span title="' + escapeHtml(localUtc) + '">' + escapeHtml(localIst) + '</span>'
+        + '</td>'
         + '<td class="preview">' + escapeHtml(r.masked_preview || '') + '</td>'
         + '<td>'
         + '<button data-act="pull" data-key="' + escapeHtml(r.key) + '">Pull</button>'
