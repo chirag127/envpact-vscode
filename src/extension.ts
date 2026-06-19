@@ -51,6 +51,7 @@ import {
   KeyStatus,
 } from './sync';
 import { renderConflictBlock } from './timestamps';
+import { generateGlobalEnv } from './global-env';
 
 let projectsProvider: ProjectsTreeProvider;
 let sharedProvider: SharedTreeProvider;
@@ -85,6 +86,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('envpact.rotateSecret', rotateSecretCommand),
     vscode.commands.registerCommand('envpact.syncGitHub', syncGitHubCommand),
     vscode.commands.registerCommand('envpact.listProjects', listProjectsCommand),
+    vscode.commands.registerCommand('envpact.syncGlobalEnv', syncGlobalEnvCommand),
     vscode.commands.registerCommand('envpact.openSyncPanel', () =>
       openSyncPanel(context, refreshAll),
     ),
@@ -421,6 +423,10 @@ async function generateEnvCommand() {
     let content: string;
     if (writeMode === 'merge' && existingText) {
       content = mergeEnvFile(existingText, safe.resolved, ordered);
+    } else if (examplePath && fs.existsSync(examplePath)) {
+      // §5: byte-faithful mirror of the example template.
+      const exampleContent = fs.readFileSync(examplePath, 'utf8');
+      content = renderEnv(ordered, safe.resolved, { project, exampleContent });
     } else {
       content = renderEnv(ordered, safe.resolved, { project });
     }
@@ -572,5 +578,33 @@ async function listProjectsCommand() {
     vscode.window.showInformationMessage(
       `${pick}: ${Object.keys(vault.projects![pick]).filter(k => !k.startsWith('_')).length} keys`,
     );
+  }
+}
+
+/**
+ * Sync the global vault `.env` mirror at `~/.envpact/.env` from the
+ * shared section of the vault, walking `~/.envpact/.env.example.global`
+ * line-by-line per SHARED_SPEC §1.6 / §5.1. Auto-creates the example
+ * file on first run by listing every shared key in alphabetical order.
+ */
+async function syncGlobalEnvCommand() {
+  if (!vaultExists()) {
+    vscode.window.showWarningMessage(
+      'envpact vault not initialised — run "envpact: Initialize Vault" first.',
+    );
+    return;
+  }
+  try {
+    const vault = loadVault();
+    const r = generateGlobalEnv(vault);
+    const tail = r.generatedGlobalExample
+      ? ` (auto-generated ${r.examplePath})`
+      : '';
+    vscode.window.showInformationMessage(
+      `envpact: wrote ${r.outputPath} (${r.resolvedCount} keys, ` +
+        `${r.encrypted} encrypted, ${r.notInVault} not in vault)${tail}`,
+    );
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`envpact: sync global .env failed — ${e.message}`);
   }
 }

@@ -2,7 +2,7 @@
   "name": "envpact",
   "displayName": "envpact",
   "description": "Centralized, serverless secrets manager — manage your private vault visually inside VS Code.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "chirag127",
   "engines": {
     "vscode": "^1.85.0"
@@ -34,7 +34,8 @@
     "onCommand:envpact.generateEnv",
     "onCommand:envpact.initVault",
     "onCommand:envpact.refreshVault",
-    "onCommand:envpact.openSyncPanel"
+    "onCommand:envpact.openSyncPanel",
+    "onCommand:envpact.syncGlobalEnv"
   ],
   "contributes": {
     "commands": [
@@ -90,6 +91,10 @@
       {
         "command": "envpact.pushKeyForce",
         "title": "envpact: Force push (overwrite vault)"
+      },
+      {
+        "command": "envpact.syncGlobalEnv",
+        "title": "envpact: Sync Global .env"
       }
     ],
     "viewsContainers": {
