@@ -24,18 +24,28 @@ vault schema (flat, single-environment, per-key timestamps).
 ## Key Files
 
 - `src/extension.ts` — activation, command handlers, status bar,
-  tree-view → Pull/Push command glue.
+  tree-view → Pull/Push command glue. Conflict prompts render
+  SHARED_SPEC §1.5 dual-timestamp blocks via `renderConflictBlock`.
 - `src/sidebar.ts` — TreeDataProvider implementations + status icons.
 - `src/syncPanel.ts` — webview wiring, host-side state computation.
 - `src/syncPanelHtml.ts` — pure HTML renderer (no `vscode` import,
-  unit-testable).
+  unit-testable). Webview script ships an Asia/Kolkata IST formatter
+  + UTC `title=` tooltips per §1.5.
 - `src/sync.ts` — TypeScript port of envpact-cli/lib/sync.js
   (getKeyStatus, pullKey, pushKey, loadLock/saveLock, statusReport).
+- `src/timestamps.ts` — UTC+IST dual-render helpers
+  (`formatTimestamp`, `newerSide`, `renderConflictBlock`,
+  `newerSideLabel`). Mirrors envpact-cli/lib/timestamps.js.
+- `src/global-env.ts` — generate `~/.envpact/.env` from
+  `~/.envpact/.env.example.global` per §1.6/§5.1. Auto-creates the
+  template on first run; encrypted entries become commented
+  placeholders.
 - `src/vault.ts` — load/save/git ops, v3 entry mutation helpers.
 - `src/resolver.ts` — resolution algorithm (mirrors CLI), v1/v2 → v3
   in-memory upgrade, `maskValue`.
-- `src/envwriter.ts` — .env rendering, parsing, merging (no env
-  header in v3).
+- `src/envwriter.ts` — `.env` rendering, parsing, merging. Now
+  byte-faithful per §5: `renderEnv(ordered, values, {exampleContent})`
+  walks `.env.example` line-by-line.
 - `src/encryption-guard.ts` — `pickEncryptionFailure`,
   `stripEncrypted`, `formatEncryptionErrorMessage`.
 - `package.json` — manifest with all command/menu/view contributions.

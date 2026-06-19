@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.6.0] - 2026-06-19
+
+v3.1 UX additions per [SHARED_SPEC §1.5/§1.6/§5/§9](../specs/SHARED_SPEC.md).
+No on-disk schema change — every change is additive.
+
+### Added
+
+- **Dual-render timestamps (UTC + IST) on every conflict prompt.** The
+  per-key Pull/Push modal now includes a SHARED_SPEC §1.5 conflict
+  block whenever the underlying status is `local_newer`,
+  `vault_newer`, or `both_diverged`. Vault and local timestamps are
+  shown in BOTH the canonical ISO UTC string and the `YYYY-MM-DD
+  HH:MM:SS IST` rendering. Whichever side is newer gets a
+  `(Recommended — newer)` annotation. The user keeps full control —
+  the recommendation is informational only.
+- **Sync panel webview displays IST with UTC tooltip.** The
+  Last-modified column now shows the IST formatting of each
+  timestamp; hovering reveals the verbatim UTC ISO string in a
+  `title=` tooltip. Conflict-status badges grow a small
+  `(newer side: vault)` / `(newer side: local)` hint label so the
+  user can see at a glance which side to accept.
+- **`envpact: Sync Global .env` command** (palette only). Generates
+  `~/.envpact/.env` from `~/.envpact/.env.example.global`, mirroring
+  every shared secret in the vault. The example template is
+  auto-created on first run by listing every `shared.*` key in
+  alphabetical order. Encrypted entries become commented placeholders
+  (`# KEY: encrypted — decrypt-via-cli`); missing keys become
+  `# KEY: not in vault`. File mode `0600` (best-effort on Windows).
+  Atomic write. The notification reports
+  `wrote ~/.envpact/.env (N keys, M encrypted, K not in vault)`.
+- **`src/timestamps.ts`** — pure UTC+IST helpers. IST is fixed to
+  `Asia/Kolkata` regardless of host timezone via
+  `Intl.DateTimeFormat`. Exports `formatTimestamp`, `newerSide`,
+  `renderConflictBlock`, `newerSideLabel`. Mirrors
+  `envpact-cli/lib/timestamps.js` byte-for-byte semantics so every
+  envpact component shows identical timestamps.
+- **`src/global-env.ts`** — pure body renderer + atomic write
+  pipeline for the global `.env` mirror.
+
+### Changed
+
+- **`renderEnv` is byte-faithful** when given an `exampleContent`
+  argument. Walks `.env.example` line by line preserving comments
+  (with leading whitespace), blank lines, CRLF line endings, and
+  trailing-newline-or-not. Missing keys become `# KEY: unresolved`
+  comment lines. Legacy callers that don't pass `exampleContent` get
+  the prior flat `KEY=value` body.
+- **`generateEnvCommand`** reads the example file's bytes and passes
+  them through so generated `.env` files now mirror the example's
+  formatting exactly when the example file is on disk.
+
+### Migration from 0.5.0
+
+Drop-in. v3.1 is purely additive UX — vault format is unchanged. If
+you don't run the new `envpact: Sync Global .env` command, nothing
+in `~/.envpact/` is touched.
+
 ## [0.5.0] - 2026-06-19
 
 ### BREAKING
