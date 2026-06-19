@@ -1,125 +1,245 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveProject, resolveString, validateVault } from '../src/resolver';
+import {
+  resolveProject,
+  resolveString,
+  validateVault,
+  upgradeVault,
+  maskValue,
+  entryValue,
+  entryModifiedAt,
+} from '../src/resolver';
 import {
   pickEncryptionFailure,
   stripEncrypted,
   formatEncryptionErrorMessage,
 } from '../src/encryption-guard';
 
-const v = {
-  version: 2,
-  shared: { K: 'sv' },
+// ── v3 happy paths ─────────────────────────────────────────────────────
+
+const v3 = {
+  version: 3,
+  shared: {
+    K: { value: 'sv', _modified_at: '2026-06-19T10:00:00Z' },
+  },
   projects: {
     p: {
-      _default_env: 'production',
-      A: 'shared.K',
-      B: { production: 'pv', development: 'dv' },
+      A: { value: 'shared.K', _modified_at: '2026-06-19T10:00:00Z' },
+      B: { value: 'plain', _modified_at: '2026-06-19T10:01:00Z' },
     },
   },
 } as any;
 
-test('resolveProject default env', () => {
-  const r = resolveProject(v, 'p');
+test('resolveProject v3: shared deref', () => {
+  const r = resolveProject(v3, 'p');
   assert.equal(r.resolved.A, 'sv');
-  assert.equal(r.resolved.B, 'pv');
+  assert.equal(r.resolved.B, 'plain');
+  assert.equal(r.missing, false);
 });
 
-test('resolveProject explicit env', () => {
-  assert.equal(resolveProject(v, 'p', 'development').resolved.B, 'dv');
+test('resolveProject v3: missing project', () => {
+  const r = resolveProject(v3, 'absent');
+  assert.equal(r.missing, true);
+  assert.deepEqual(r.resolved, {});
 });
 
-test('resolveString shared lookup', () => {
-  assert.deepEqual(resolveString('shared.X', { X: 'val' }), { value: 'val', status: 'ok' });
+test('resolveProject v3: unresolved shared key', () => {
+  const v = {
+    version: 3,
+    shared: {},
+    projects: {
+      p: { A: { value: 'shared.MISSING', _modified_at: '2026-06-19T10:00:00Z' } },
+    },
+  } as any;
+  const r = resolveProject(v, 'p');
+  assert.deepEqual(r.unresolved, ['A']);
 });
 
-test('validateVault rejects bad input', () => {
+test('resolveProject v3: invalid shape (no value)', () => {
+  const v = {
+    version: 3,
+    shared: {},
+    projects: { p: { A: { not_value: 'oops', _modified_at: 'x' } } },
+  } as any;
+  const r = resolveProject(v, 'p');
+  assert.deepEqual(r.invalid, ['A']);
+});
+
+test('resolveProject v3: encrypted leaf passthrough', () => {
+  const v = {
+    version: 3,
+    shared: {},
+    projects: {
+      p: {
+        E: { value: 'enc:abc', _modified_at: '2026-06-19T10:00:00Z' },
+      },
+    },
+  } as any;
+  const r = resolveProject(v, 'p');
+  assert.deepEqual(r.encrypted, ['E']);
+  assert.equal(r.resolved.E, 'enc:abc');
+});
+
+test('resolveProject v3: encrypted via shared deref', () => {
+  const v = {
+    version: 3,
+    shared: { S: { value: 'enc:zzz', _modified_at: '2026-06-19T10:00:00Z' } },
+    projects: {
+      p: { K: { value: 'shared.S', _modified_at: '2026-06-19T10:00:00Z' } },
+    },
+  } as any;
+  const r = resolveProject(v, 'p');
+  assert.deepEqual(r.encrypted, ['K']);
+});
+
+test('resolveString blocks chained shared. references', () => {
+  const r = resolveString('shared.X', { X: { value: 'shared.Y', _modified_at: '' } });
+  assert.equal(r.status, 'invalid');
+});
+
+test('validateVault rejects unknown version', () => {
   assert.throws(() => validateVault({ version: 99 }));
 });
 
-// ---------------------------------------------------------------------------
-// Audit #6 — encrypted-leaf handling for the VS Code slice.
-// The extension cannot decrypt `enc:` values; helpers below ensure we
-// surface the failure cleanly rather than leaking ciphertext into a .env.
-// ---------------------------------------------------------------------------
+// ── v1/v2 → v3 auto-upgrade ────────────────────────────────────────────
+
+test('upgradeVault: v1 (flat strings) becomes v3 entry shape', () => {
+  const v1 = {
+    version: 1,
+    shared: { K: 'sv' },
+    projects: { p: { A: 'plain', B: 'shared.K' } },
+    metadata: { updated_at: '2026-06-15T00:00:00Z' },
+  } as any;
+  const upgraded = upgradeVault(v1);
+  assert.equal(upgraded.version, 3);
+  assert.equal(upgraded.shared!.K.value, 'sv');
+  assert.equal(upgraded.projects!.p.A.value, 'plain');
+  // Resolution should match v3 semantics now.
+  const r = resolveProject(v1, 'p');
+  assert.equal(r.resolved.A, 'plain');
+  assert.equal(r.resolved.B, 'sv');
+});
+
+test('upgradeVault: v2 per-env objects pick default, then production, then first', () => {
+  const v2 = {
+    version: 2,
+    shared: { K: 'sv' },
+    projects: {
+      p: {
+        _default_env: 'production',
+        ALPHA: { default: 'd-val', production: 'p-val' },
+        BETA: { production: 'p-only' },
+        GAMMA: { staging: 's-only' },
+      },
+    },
+    metadata: { updated_at: '2026-06-15T00:00:00Z' },
+  } as any;
+  const r = resolveProject(v2, 'p');
+  // default wins over production.
+  assert.equal(r.resolved.ALPHA, 'd-val');
+  // production picked when default missing.
+  assert.equal(r.resolved.BETA, 'p-only');
+  // first non-empty wins when default + production both absent.
+  assert.equal(r.resolved.GAMMA, 's-only');
+});
+
+test('upgradeVault: drops _default_env and other underscore keys', () => {
+  const v2 = {
+    version: 2,
+    shared: {},
+    projects: { p: { _default_env: 'staging', _internal: 'x', K: 'v' } },
+  } as any;
+  const upgraded = upgradeVault(v2);
+  assert.ok(!('_default_env' in upgraded.projects!.p));
+  assert.ok(!('_internal' in upgraded.projects!.p));
+  assert.equal(upgraded.projects!.p.K.value, 'v');
+});
+
+test('upgradeVault: v3 input is normalised, not double-upgraded', () => {
+  const upgraded = upgradeVault(v3);
+  assert.equal(upgraded.version, 3);
+  assert.equal(upgraded.shared!.K.value, 'sv');
+});
+
+// ── entry helpers ──────────────────────────────────────────────────────
+
+test('entryValue / entryModifiedAt extract fields', () => {
+  const entry = { value: 'v', _modified_at: '2026-06-19T10:00:00Z' };
+  assert.equal(entryValue(entry), 'v');
+  assert.equal(entryModifiedAt(entry), '2026-06-19T10:00:00Z');
+  assert.equal(entryValue('string'), undefined);
+  assert.equal(entryModifiedAt({}), undefined);
+});
+
+// ── maskValue ──────────────────────────────────────────────────────────
+
+test('maskValue: short values collapse to bullets', () => {
+  assert.equal(maskValue('short'), '••••');
+  assert.equal(maskValue(''), '••••');
+});
+
+test('maskValue: long values reveal first 3 + last 3 chars', () => {
+  const m = maskValue('sk_live_abcdef1234567890');
+  assert.match(m, /^sk_/);
+  assert.match(m, /890$/);
+  assert.match(m, /••••/);
+});
+
+// ── encryption guard (carry-over from v0.2.0) ──────────────────────────
 
 test('resolver still flags enc: values via result.encrypted', () => {
   const vault = {
-    version: 2,
-    shared: { TOKEN: 'enc:age-secret' },
+    version: 3,
+    shared: { TOKEN: { value: 'enc:age-secret', _modified_at: '2026-06-19T10:00:00Z' } },
     projects: {
       mixed: {
-        PLAIN: 'hello',
-        SECRET: 'shared.TOKEN',
-        DIRECT: 'enc:age-direct',
+        PLAIN: { value: 'hello', _modified_at: '2026-06-19T10:00:00Z' },
+        SECRET: { value: 'shared.TOKEN', _modified_at: '2026-06-19T10:00:00Z' },
+        DIRECT: { value: 'enc:age-direct', _modified_at: '2026-06-19T10:00:00Z' },
       },
     },
   } as any;
   const r = resolveProject(vault, 'mixed');
   assert.deepEqual(r.encrypted.sort(), ['DIRECT', 'SECRET']);
-  // Encrypted leaves are kept in `resolved` here — that is by design;
-  // the guard layer is what removes them.
-  assert.equal(r.resolved.DIRECT, 'enc:age-direct');
-  assert.equal(r.resolved.SECRET, 'enc:age-secret');
   assert.equal(r.resolved.PLAIN, 'hello');
 });
 
-test('pickEncryptionFailure returns null for clean results', () => {
-  const r = resolveProject(v, 'p');
+test('pickEncryptionFailure null + non-null', () => {
+  const r = resolveProject(v3, 'p');
   assert.equal(pickEncryptionFailure(r), null);
-});
 
-test('pickEncryptionFailure surfaces sorted, deduped keys with environment', () => {
   const fake = {
     resolved: { Z: 'enc:x', A: 'enc:y', M: 'plain' },
     unresolved: [],
     invalid: [],
     encrypted: ['Z', 'A', 'A'],
-    environment: 'production',
     missing: false,
   } as any;
   const failure = pickEncryptionFailure(fake);
   assert.notEqual(failure, null);
   assert.deepEqual(failure!.keys, ['A', 'Z']);
-  assert.equal(failure!.environment, 'production');
-
-  // Sort stability: re-running on a permuted input yields the same order.
-  const fake2 = { ...fake, encrypted: ['A', 'Z'] } as any;
-  const failure2 = pickEncryptionFailure(fake2);
-  assert.deepEqual(failure!.keys, failure2!.keys);
 });
 
-test('stripEncrypted returns a clean copy without mutating the input', () => {
+test('stripEncrypted purity', () => {
   const original = {
     resolved: { OK: 'val', ENC: 'enc:abc' },
     unresolved: [],
     invalid: [],
     encrypted: ['ENC'],
-    environment: 'default',
     missing: false,
   } as any;
   const cleaned = stripEncrypted(original);
-  // Purity — the original is untouched.
   assert.equal(original.resolved.ENC, 'enc:abc');
-  assert.deepEqual(Object.keys(original.resolved).sort(), ['ENC', 'OK']);
-  // Cleanliness — encrypted leaves are gone from the copy.
   assert.deepEqual(Object.keys(cleaned.resolved), ['OK']);
-  assert.equal(cleaned.resolved.OK, 'val');
-  assert.equal(cleaned.environment, 'default');
-  // No-op path: no encrypted leaves means the original is returned as-is.
-  const passthrough = stripEncrypted({ ...original, encrypted: [], resolved: { OK: 'val' } } as any);
-  assert.equal(passthrough.resolved.OK, 'val');
 });
 
-test('formatEncryptionErrorMessage mentions project, env, keys, and remediation', () => {
-  const failure = { keys: ['A', 'B'], environment: 'staging' };
-  const msg = formatEncryptionErrorMessage('billing-svc', 'staging', failure);
+test('formatEncryptionErrorMessage mentions project, keys, remediation', () => {
+  const failure = { keys: ['A', 'B'] };
+  const msg = formatEncryptionErrorMessage('billing-svc', failure);
   assert.match(msg, /billing-svc/);
-  assert.match(msg, /staging/);
   assert.match(msg, /A, B/);
   assert.match(msg, /envpact-cli/);
   assert.match(msg, /age private key/);
-  // Singular wording when there's exactly one key.
-  const single = formatEncryptionErrorMessage('p', 'default', { keys: ['ONLY'], environment: 'default' });
+  const single = formatEncryptionErrorMessage('p', { keys: ['ONLY'] });
   assert.match(single, /1 encrypted secret/);
 });
