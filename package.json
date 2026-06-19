@@ -2,7 +2,7 @@
   "name": "envpact",
   "displayName": "envpact",
   "description": "Centralized, serverless secrets manager — manage your private vault visually inside VS Code.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "chirag127",
   "engines": {
     "vscode": "^1.85.0"
@@ -33,7 +33,8 @@
     "workspaceContains:.env.example",
     "onCommand:envpact.generateEnv",
     "onCommand:envpact.initVault",
-    "onCommand:envpact.refreshVault"
+    "onCommand:envpact.refreshVault",
+    "onCommand:envpact.openSyncPanel"
   ],
   "contributes": {
     "commands": [
@@ -68,6 +69,27 @@
       {
         "command": "envpact.listProjects",
         "title": "envpact: List Projects"
+      },
+      {
+        "command": "envpact.openSyncPanel",
+        "title": "envpact: Open Sync Panel",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "envpact.pullKey",
+        "title": "envpact: Pull this key"
+      },
+      {
+        "command": "envpact.pushKey",
+        "title": "envpact: Push this key"
+      },
+      {
+        "command": "envpact.pullKeyForce",
+        "title": "envpact: Force pull (overwrite local)"
+      },
+      {
+        "command": "envpact.pushKeyForce",
+        "title": "envpact: Force push (overwrite vault)"
       }
     ],
     "viewsContainers": {
@@ -94,17 +116,6 @@
     "configuration": {
       "title": "envpact",
       "properties": {
-        "envpact.defaultEnvironment": {
-          "type": "string",
-          "enum": [
-            "default",
-            "development",
-            "staging",
-            "production"
-          ],
-          "default": "default",
-          "description": "Default environment used when generating .env files."
-        },
         "envpact.autoPullOnGenerate": {
           "type": "boolean",
           "default": true,
@@ -113,12 +124,12 @@
         "envpact.exampleFile": {
           "type": "string",
           "default": "",
-          "description": "Workspace-relative path of the .env.example to use as the spec. Leave empty to scan and prompt."
+          "description": "Workspace-relative path of the .env.example to use as the spec. Leave empty to scan."
         },
         "envpact.outputFile": {
           "type": "string",
           "default": "",
-          "description": "Workspace-relative path of the target .env file to write. Leave empty to scan and prompt (default: .env, or the convention-paired target for the chosen example)."
+          "description": "Workspace-relative path of the target .env file to write."
         },
         "envpact.writeMode": {
           "type": "string",
@@ -129,18 +140,18 @@
             "dry-run"
           ],
           "enumDescriptions": [
-            "Ask each run (legacy v0.3.0 behaviour).",
+            "Ask each run.",
             "Always merge: vault values overlay user-edited values; user-only keys preserved (default).",
             "Always overwrite: vault contents replace the target file; user-only keys are lost.",
             "Always dry-run: print the plan, never touch disk."
           ],
           "default": "merge",
-          "description": "How to handle an existing target file when generating .env. v0.4.0 default is 'merge' — never destroys user data. Set to 'ask' to bring back the v0.3.0 prompt."
+          "description": "How to handle an existing target file when generating .env."
         },
         "envpact.autoSyncOnSave": {
           "type": "boolean",
           "default": true,
-          "description": "Auto-push changes to your vault whenever you save a .env file. Local values overwrite remote on conflict; remote-only keys are preserved; new local keys are promoted to the SHARED namespace."
+          "description": "Refresh sync status indicators automatically when a .env file is saved."
         }
       }
     },
@@ -149,7 +160,34 @@
         {
           "command": "envpact.refreshVault",
           "when": "view == envpact.projects",
-          "group": "navigation"
+          "group": "navigation@1"
+        },
+        {
+          "command": "envpact.openSyncPanel",
+          "when": "view == envpact.projects",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "envpact.pullKey",
+          "when": "view == envpact.projects && viewItem =~ /^envpactKey:/",
+          "group": "envpactSync@1"
+        },
+        {
+          "command": "envpact.pushKey",
+          "when": "view == envpact.projects && viewItem =~ /^envpactKey:/",
+          "group": "envpactSync@2"
+        },
+        {
+          "command": "envpact.pullKeyForce",
+          "when": "view == envpact.projects && viewItem =~ /^envpactKey:/",
+          "group": "envpactSync@3"
+        },
+        {
+          "command": "envpact.pushKeyForce",
+          "when": "view == envpact.projects && viewItem =~ /^envpactKey:/",
+          "group": "envpactSync@4"
         }
       ]
     }

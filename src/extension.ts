@@ -1,16 +1,14 @@
 /**
  * envpact-vscode — VS Code extension for the envpact ecosystem.
  *
- * Provides a sidebar to browse the local vault, command palette
- * commands for every operation envpact-cli supports, and codelens
- * on .env.example files showing resolution status.
+ * v0.5.0: schema v3 (flat, single-environment, per-key timestamps).
+ * Per-key sync UI lives in two places: the tree-view context menus,
+ * and a dedicated webview Sync panel (envpact.openSyncPanel).
  */
 
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 
 import {
   loadVault,
@@ -23,9 +21,8 @@ import {
   pushVault,
   detectProjectFromGit,
   SECRETS_DIR,
-  SECRETS_FILE,
 } from './vault';
-import { resolveProject } from './resolver';
+import { resolveProject, maskValue } from './resolver';
 import {
   parseEnvExample,
   parseEnvFile,
@@ -45,25 +42,14 @@ import {
 } from './encryption-guard';
 import { ensureWorkspaceSetup, WorkspaceSetup } from './setup';
 import { registerEnvSaveWatcher } from './watcher';
-
-const execFileP = promisify(execFile);
+import { openSyncPanel, runPullKey, runPushKey } from './syncPanel';
+import { resolveVaultEntry } from './sync';
 
 let projectsProvider: ProjectsTreeProvider;
 let sharedProvider: SharedTreeProvider;
 let statusBarItem: vscode.StatusBarItem;
 
-/**
- * Most recent encrypted-leaf failure surfaced by generateEnvCommand.
- * Module-level so refreshStatusBar/refreshAll can render error UI even
- * when triggered by sidebar refresh, workspace folder changes, etc.
- */
 let lastResolveError: ResolveErrorState | null = null;
-
-/**
- * Cached workspace setup (gh username + git repo + project name).
- * Populated by ensureWorkspaceSetup on activation; consulted by
- * the .env save watcher and generateEnvCommand without re-prompting.
- */
 let cachedSetup: WorkspaceSetup | null = null;
 
 function clearResolveError(): void {
@@ -79,7 +65,7 @@ export function activate(context: vscode.ExtensionContext) {
   vscode.window.registerTreeDataProvider('envpact.shared', sharedProvider);
 
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  statusBarItem.command = 'envpact.generateEnv';
+  statusBarItem.command = 'envpact.openSyncPanel';
   context.subscriptions.push(statusBarItem);
   refreshStatusBar();
 
@@ -92,26 +78,37 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('envpact.rotateSecret', rotateSecretCommand),
     vscode.commands.registerCommand('envpact.syncGitHub', syncGitHubCommand),
     vscode.commands.registerCommand('envpact.listProjects', listProjectsCommand),
-    // When the active workspace folder changes the previous error no
-    // longer applies — clear it so the sidebar/statusBar refresh.
+    vscode.commands.registerCommand('envpact.openSyncPanel', () =>
+      openSyncPanel(context, refreshAll),
+    ),
+    // Per-key sync commands. The treeItem comes from the right-click
+    // menu and exposes its contextValue at item.contextValue.
+    vscode.commands.registerCommand('envpact.pullKey', (item: vscode.TreeItem) =>
+      pullKeyFromTree(item, false),
+    ),
+    vscode.commands.registerCommand('envpact.pushKey', (item: vscode.TreeItem) =>
+      pushKeyFromTree(item, false),
+    ),
+    vscode.commands.registerCommand('envpact.pullKeyForce', (item: vscode.TreeItem) =>
+      pullKeyFromTree(item, true),
+    ),
+    vscode.commands.registerCommand('envpact.pushKeyForce', (item: vscode.TreeItem) =>
+      pushKeyFromTree(item, true),
+    ),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       clearResolveError();
-      cachedSetup = null;        // re-detect on next generate
+      cachedSetup = null;
       refreshAll();
-    })
+    }),
   );
 
-  // Silent first-run discovery: gh username + git remote → project name.
-  // Cached in .vscode/envpact.json so subsequent activations are instant.
-  // The watcher needs this synchronously, so we kick it off and register
-  // the save watcher with a getter that consults the populated cache.
   const ws0 = vscode.workspace.workspaceFolders?.[0];
   if (ws0) {
     ensureWorkspaceSetup(ws0.uri.fsPath)
-      .then((s) => { cachedSetup = s; })
+      .then((s) => { cachedSetup = s; refreshAll(); })
       .catch(() => { /* user cancelled — generateEnv will retry */ });
   }
-  registerEnvSaveWatcher(context, () => cachedSetup?.projectName ?? '');
+  registerEnvSaveWatcher(context, refreshAll);
 }
 
 export function deactivate() { /* no-op */ }
@@ -124,12 +121,10 @@ function refreshStatusBar() {
       statusBarItem.text =
         `$(error) envpact: ${lastResolveError.keys.length} enc: secret(s) — cannot decrypt`;
       statusBarItem.tooltip = lastResolveError.message;
-      // VS Code only ships one warning/error background colour pair on
-      // the status bar; pick the error one when we're in this state.
       statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
     } else {
       statusBarItem.text = `$(lock) envpact: ${project || 'ready'}`;
-      statusBarItem.tooltip = `envpact vault at ${SECRETS_DIR}\nClick to generate .env`;
+      statusBarItem.tooltip = `envpact vault at ${SECRETS_DIR}\nClick to open the Sync panel`;
       statusBarItem.backgroundColor = undefined;
     }
   } else {
@@ -147,13 +142,104 @@ function refreshAll() {
   refreshStatusBar();
 }
 
+// ---------------------------------------------------------------
+// Per-key sync helpers (tree view → command)
+// ---------------------------------------------------------------
+
+/**
+ * Parse the tree item's contextValue, which encodes the scope, project,
+ * and key as `envpactKey:<scope>:<project>:<KEY>`. Returns null when
+ * the contextValue isn't one of ours (the menu shouldn't fire then,
+ * but be defensive).
+ */
+function parseKeyContext(item: vscode.TreeItem | undefined):
+  { scope: 'project' | 'shared'; project: string; key: string } | null {
+  if (!item || typeof item.contextValue !== 'string') return null;
+  const parts = item.contextValue.split(':');
+  if (parts.length < 4 || parts[0] !== 'envpactKey') return null;
+  const scope = parts[1];
+  if (scope !== 'project' && scope !== 'shared') return null;
+  return { scope, project: parts[2] || '', key: parts.slice(3).join(':') };
+}
+
+async function confirmAndDispatch(
+  item: vscode.TreeItem | undefined,
+  direction: 'pull' | 'push',
+  force: boolean,
+): Promise<void> {
+  const ctx = parseKeyContext(item);
+  if (!ctx) {
+    vscode.window.showErrorMessage('envpact: right-click a key in the Projects view to use this action.');
+    return;
+  }
+  const ws = vscode.workspace.workspaceFolders?.[0];
+  if (!ws) {
+    vscode.window.showErrorMessage('Open a workspace folder first.');
+    return;
+  }
+  const wsRoot = ws.uri.fsPath;
+
+  // Build a masked-only confirmation prompt. The first/last 3 chars
+  // are the most a user-facing prompt is allowed to reveal — and even
+  // that only when length ≥ 8. Shorter values collapse to ••••.
+  let preview = '';
+  try {
+    if (direction === 'pull') {
+      const vault = loadVault();
+      const entry = resolveVaultEntry(vault, ctx.project, ctx.key);
+      preview = entry ? maskValue(entry.value) : '(not in vault)';
+    } else {
+      const localMap = parseEnvFile(path.join(wsRoot, '.env'));
+      preview = ctx.key in localMap ? maskValue(localMap[ctx.key]) : '(not in .env)';
+    }
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`envpact: ${e.message}`);
+    return;
+  }
+
+  const verb = direction === 'pull' ? 'Pull' : 'Push';
+  const target = direction === 'pull' ? 'local .env' : 'vault';
+  const forceLabel = force ? ' (force — overrides conflict refusal)' : '';
+  const proceed = await vscode.window.showWarningMessage(
+    `${verb} ${ctx.key} → ${target}${forceLabel}\n\nValue preview (masked): ${preview}\n\nContinue?`,
+    { modal: true },
+    verb,
+    'Cancel',
+  );
+  if (proceed !== verb) return;
+
+  try {
+    if (direction === 'pull') {
+      await runPullKey(ctx.key, force);
+    } else {
+      await runPushKey(ctx.key, force);
+    }
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`envpact: ${e.message}`);
+    return;
+  }
+  refreshAll();
+}
+
+async function pullKeyFromTree(item: vscode.TreeItem | undefined, force: boolean) {
+  return confirmAndDispatch(item, 'pull', force);
+}
+
+async function pushKeyFromTree(item: vscode.TreeItem | undefined, force: boolean) {
+  return confirmAndDispatch(item, 'push', force);
+}
+
+// ---------------------------------------------------------------
+// Existing commands (env-stripped)
+// ---------------------------------------------------------------
+
 async function generateEnvCommand() {
   try {
     if (!vaultExists()) {
       const ans = await vscode.window.showWarningMessage(
         'envpact vault is not initialised. Initialize now?',
         'Initialize',
-        'Cancel'
+        'Cancel',
       );
       if (ans !== 'Initialize') return;
       return initVaultCommand();
@@ -165,49 +251,29 @@ async function generateEnvCommand() {
       return;
     }
     const cwd = ws.uri.fsPath;
-    // Use the cached setup (silent gh + git detection). Falls back to
-    // the legacy detectProjectFromGit if anything went wrong upstream.
     if (!cachedSetup) {
       try {
         cachedSetup = await ensureWorkspaceSetup(cwd);
       } catch {
-        // User cancelled the setup prompt — bail.
         return;
       }
     }
     const project = cachedSetup.projectName || detectProjectFromGit(cwd);
 
     const cfg = vscode.workspace.getConfiguration('envpact');
-    const defaultEnv = cfg.get<string>('defaultEnvironment', 'default');
-    const envChoice = await vscode.window.showQuickPick(
-      ['default', 'development', 'staging', 'production', 'Custom…'],
-      { placeHolder: `Environment (default: ${defaultEnv})`, ignoreFocusOut: true }
-    );
-    if (!envChoice) return;
-    let environment = envChoice === 'Custom…'
-      ? await vscode.window.showInputBox({ prompt: 'Custom environment name', ignoreFocusOut: true }) ?? ''
-      : envChoice;
-    if (environment === 'default') environment = '';
-
     if (cfg.get<boolean>('autoPullOnGenerate', true)) {
       const r = pullVault();
       if (!r.ok) vscode.window.showWarningMessage(`Vault pull warning: ${r.error}`);
     }
 
     const vault = loadVault();
-    const result = resolveProject(vault, project, environment || undefined);
+    const result = resolveProject(vault, project);
 
-    // Bail BEFORE writing .env if the resolver flagged any encrypted
-    // leaves: we have no age private key here, so the literal `enc:...`
-    // would otherwise leak into the file. Surface the failure on the
-    // status bar, sidebar, and via a toast that exposes the same
-    // recovery actions syncGitHubCommand uses.
     const failure = pickEncryptionFailure(result);
     if (failure) {
-      const message = formatEncryptionErrorMessage(project, result.environment, failure);
+      const message = formatEncryptionErrorMessage(project, failure);
       lastResolveError = {
         project,
-        environment: result.environment,
         keys: failure.keys,
         message,
       };
@@ -215,7 +281,7 @@ async function generateEnvCommand() {
       const choice = await vscode.window.showErrorMessage(
         message,
         'Run envpact-cli',
-        'Show in Vault'
+        'Show in Vault',
       );
       if (choice === 'Run envpact-cli') {
         const term = vscode.window.createTerminal({ name: 'envpact generate' });
@@ -227,38 +293,16 @@ async function generateEnvCommand() {
       return;
     }
 
-    // Defensive: even if pickEncryptionFailure returned null (no encrypted
-    // keys), stripEncrypted is a no-op. Keep it on the success path so
-    // future resolver changes that mark partial successes don't quietly
-    // leak ciphertext into a .env.
     const safe = stripEncrypted(result);
     clearResolveError();
 
-    // ── File discovery + source/target prompts ────────────────────────
-    // v0.4.0 ZERO-PROMPT BEHAVIOUR:
-    //   - exampleFile/outputFile setting? Use it.
-    //   - Else, scan the workspace and pick by convention:
-    //       * .env.example → .env (the most common pair)
-    //       * if no .env.example, derive from vault keys directly
-    //   - We never QuickPick the user any more. They can override
-    //     by editing .vscode/settings.json once.
     const exampleSetting = cfg.get<string>('exampleFile', '').trim();
     const outputSetting = cfg.get<string>('outputFile', '').trim();
 
     const scan = discoverEnvFiles(cwd);
     let exampleName = exampleSetting;
     if (!exampleName && scan.examples.length) {
-      // Convention: the first example file in sort order is .env.example,
-      // followed by environment-specific examples. Match the active env
-      // if possible (e.g. environment === 'production' picks
-      // .env.production.example), otherwise default to the first.
-      if (environment) {
-        const envSpecific = scan.examples.find((e) =>
-          e === `.env.${environment}.example`
-        );
-        if (envSpecific) exampleName = envSpecific;
-      }
-      if (!exampleName) exampleName = scan.examples[0];
+      exampleName = scan.examples[0];
     }
 
     let outputName = outputSetting;
@@ -271,25 +315,19 @@ async function generateEnvCommand() {
     const ordered = required.length ? required : Object.keys(safe.resolved);
     const out = path.join(cwd, outputName);
 
-    // ── Write mode (Merge / Overwrite / Dry-run) ──────────────────────
-    // v0.4.0: 'ask' is no longer the default — 'merge' is. The whole
-    // point of v0.4.0 is zero prompts, and merge can never destroy
-    // user data. The user can still override via the writeMode setting
-    // if they want overwrite or dry-run behaviour.
     const writeModeSetting = cfg.get<string>(
       'writeMode',
       'merge',
     ) as 'ask' | 'merge' | 'overwrite' | 'dry-run';
     let writeMode: 'merge' | 'overwrite' | 'dry-run';
     if (writeModeSetting === 'ask') {
-      // Legacy: still honoured if pinned, but no longer the default.
       const pickMode = await vscode.window.showQuickPick(
         [
           { label: 'Merge', description: 'Vault values overlay your .env; user-only keys preserved (recommended)' },
           { label: 'Overwrite', description: 'Replace target file with vault contents — user-only keys are lost' },
           { label: 'Dry run', description: 'Show what would change; do not write' },
         ],
-        { placeHolder: `Write mode for ${outputName}`, ignoreFocusOut: true }
+        { placeHolder: `Write mode for ${outputName}`, ignoreFocusOut: true },
       );
       if (!pickMode) return;
       writeMode = pickMode.label === 'Merge'
@@ -318,7 +356,7 @@ async function generateEnvCommand() {
 
     if (writeMode === 'dry-run') {
       vscode.window.showInformationMessage(
-        `envpact (dry run) ${outputName}: +${plan.added.length} added, ${plan.overwritten.length} overwritten, ${plan.kept.length} preserved, ${plan.unchanged.length} unchanged.`
+        `envpact (dry run) ${outputName}: +${plan.added.length} added, ${plan.overwritten.length} overwritten, ${plan.kept.length} preserved, ${plan.unchanged.length} unchanged.`,
       );
       refreshAll();
       return;
@@ -328,7 +366,7 @@ async function generateEnvCommand() {
     if (writeMode === 'merge' && existingText) {
       content = mergeEnvFile(existingText, safe.resolved, ordered);
     } else {
-      content = renderEnv(ordered, safe.resolved, { project, environment: safe.environment });
+      content = renderEnv(ordered, safe.resolved, { project });
     }
 
     writeEnvAtomic(out, content);
@@ -336,10 +374,10 @@ async function generateEnvCommand() {
 
     const summary = writeMode === 'merge' && existingText
       ? `merged into ${outputName}: +${plan.added.length}, ~${plan.overwritten.length}, kept ${plan.kept.length} user key(s)`
-      : `wrote ${Object.keys(safe.resolved).length} keys to ${outputName} (env=${safe.environment})`;
+      : `wrote ${Object.keys(safe.resolved).length} keys to ${outputName}`;
     vscode.window.showInformationMessage(
       `envpact: ${summary}` +
-      (safe.unresolved.length ? `. Unresolved: ${safe.unresolved.join(', ')}` : '')
+      (safe.unresolved.length ? `. Unresolved: ${safe.unresolved.join(', ')}` : ''),
     );
     refreshAll();
   } catch (e: any) {
@@ -357,7 +395,7 @@ async function initVaultCommand() {
       { label: 'Auto (recommended)', detail: 'Run `envpact-cli --init auto` — creates a private repo via gh CLI.' },
       { label: 'Existing vault URL', detail: 'I already have a vault repo somewhere.' },
     ],
-    { placeHolder: 'Initialise envpact vault', ignoreFocusOut: true }
+    { placeHolder: 'Initialise envpact vault', ignoreFocusOut: true },
   );
   if (!choice) return;
 
@@ -373,15 +411,13 @@ async function initVaultCommand() {
     if (!url) return;
     term.sendText(`npx envpact-cli --init ${url}`);
   }
-  // Whatever was wrong before, an init flow makes the previous failure
-  // stale — wipe it so the UI doesn't lie about the new vault.
   clearResolveError();
-  vscode.window.showInformationMessage('envpact: initialisation started in terminal. Run "envpact: Refresh Vault" when done.');
+  vscode.window.showInformationMessage(
+    'envpact: initialisation started in terminal. Run "envpact: Refresh Vault" when done.',
+  );
 }
 
 async function refreshVaultCommand() {
-  // A fresh pull may bring in new plaintext or rotate the encrypted
-  // values, so the previous error is no longer authoritative.
   clearResolveError();
   const r = pullVault();
   if (r.ok) vscode.window.showInformationMessage('envpact: vault pulled');
@@ -400,15 +436,12 @@ async function addSecretCommand() {
   const key = await vscode.window.showInputBox({ prompt: 'Key (e.g. OPENAI_API_KEY)', ignoreFocusOut: true });
   if (!key) return;
   const value = await vscode.window.showInputBox({
-    prompt: `Value (or "shared.KEY" reference)`, password: true, ignoreFocusOut: true,
+    prompt: 'Value (or "shared.KEY" reference)', password: true, ignoreFocusOut: true,
   });
   if (value == null) return;
-  const env = await vscode.window.showInputBox({
-    prompt: 'Environment (leave empty for flat)', ignoreFocusOut: true,
-  }) ?? '';
 
   const vault = loadVault();
-  setProjectSecret(vault, targetProject, key, value, env || undefined);
+  setProjectSecret(vault, targetProject, key, value);
   saveVault(vault);
   pushVault(`envpact-vscode: set ${targetProject}.${key}`);
   vscode.window.showInformationMessage(`envpact: set ${targetProject}.${key}`);
@@ -481,7 +514,7 @@ async function listProjectsCommand() {
   const pick = await vscode.window.showQuickPick(projects, { placeHolder: 'Projects in vault' });
   if (pick) {
     vscode.window.showInformationMessage(
-      `${pick}: ${Object.keys(vault.projects![pick]).filter(k => !k.startsWith('_')).length} keys`
+      `${pick}: ${Object.keys(vault.projects![pick]).filter(k => !k.startsWith('_')).length} keys`,
     );
   }
 }
