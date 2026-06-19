@@ -159,7 +159,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "tsc --noEmit -p ./",
-    "test": "node --test --import tsx tests/*.test.ts",
+    "test": "node scripts/test.mjs",
     "package": "vsce package",
     "publish": "vsce publish"
   },
